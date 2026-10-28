@@ -15,10 +15,10 @@ dynamic = ["dependencies"]
 dependencies = { file = ["requirements.txt"] }
 
 [project.urls]
-Repository = "https://github.com/OWNER/ComfyUI_ZXin"
-"Bug Tracker" = "https://github.com/OWNER/ComfyUI_ZXin/issues"
+Repository = "https://github.com/ZXinGod/ComfyUI_ZXin"
+"Bug Tracker" = "https://github.com/ZXinGod/ComfyUI_ZXin/issues"
 
 [tool.comfy]
-PublisherId = "OWNER"
+PublisherId = "ZXinGod"
 DisplayName = "ZXin Batch Image Tools"
 requires-comfyui = ">=0.3.0"

@@ -17,7 +17,7 @@
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/OWNER/ComfyUI_ZXin.git
+git clone https://github.com/ZXinGod/ComfyUI_ZXin.git
 ```
 
 然后重启 ComfyUI。
