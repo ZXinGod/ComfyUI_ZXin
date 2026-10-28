@@ -1,0 +1,287 @@
+{
+  "last_node_id": 4,
+  "last_link_id": 4,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "ZXIN_BatchImageLoader",
+      "pos": [
+        -620,
+        60
+      ],
+      "size": {
+        "0": 420,
+        "1": 640
+      },
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "图片列表",
+          "type": "IMAGE",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "文件夹预览图",
+          "type": "IMAGE",
+          "links": [
+            2
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "文件名列表",
+          "type": "STRING",
+          "links": [
+            3
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "加载数量",
+          "type": "INT",
+          "links": [],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ZXIN_BatchImageLoader",
+        "cnr_id": "zxin-batch-image-tools"
+      },
+      "widgets_values": [
+        "input",
+        "*",
+        "按名称升序",
+        0,
+        0,
+        "仅CPU",
+        true,
+        4,
+        192,
+        ""
+      ],
+      "title": "① 批量图像加载器（选好文件夹，看预览图）",
+      "color": "#223"
+    },
+    {
+      "id": 2,
+      "type": "ZXIN_BatchImageDistributor",
+      "pos": [
+        -100,
+        60
+      ],
+      "size": {
+        "0": 400,
+        "1": 260
+      },
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "图片列表",
+          "type": "IMAGE",
+          "link": 1,
+          "slot_index": 0
+        }
+      ],
+      "outputs": [
+        {
+          "name": "批次列表",
+          "type": "IMAGE",
+          "links": [
+            4
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "分批清单",
+          "type": "STRING",
+          "links": [],
+          "slot_index": 0
+        },
+        {
+          "name": "批次数",
+          "type": "INT",
+          "links": [],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ZXIN_BatchImageDistributor",
+        "cnr_id": "zxin-batch-image-tools"
+      },
+      "widgets_values": [
+        4,
+        false
+      ],
+      "title": "② 批次分发器（每批几张 → 自动跑几轮）",
+      "color": "#232"
+    },
+    {
+      "id": 3,
+      "type": "ZXIN_BatchImageSaver",
+      "pos": [
+        420,
+        -40
+      ],
+      "size": {
+        "0": 400,
+        "1": 300
+      },
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "图片列表",
+          "type": "IMAGE",
+          "link": 4,
+          "slot_index": 0
+        },
+        {
+          "name": "文件名列表",
+          "type": "STRING",
+          "link": 3,
+          "slot_index": 0
+        }
+      ],
+      "outputs": [
+        {
+          "name": "图像批次",
+          "type": "IMAGE",
+          "links": [],
+          "slot_index": 0
+        },
+        {
+          "name": "已保存文件",
+          "type": "STRING",
+          "links": [],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ZXIN_BatchImageSaver",
+        "cnr_id": "zxin-batch-image-tools"
+      },
+      "widgets_values": [
+        "ZXinBatch",
+        "沿用源文件名",
+        null,
+        true
+      ],
+      "title": "③ 批量保存器（沿用源文件名）",
+      "color": "#322"
+    },
+    {
+      "id": 4,
+      "type": "PreviewImage",
+      "pos": [
+        -100,
+        400
+      ],
+      "size": {
+        "0": 400,
+        "1": 460
+      },
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 2,
+          "slot_index": 0
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage",
+        "cnr_id": "zxin-batch-image-tools"
+      },
+      "widgets_values": [],
+      "title": "文件夹预览图（先看看里面有什么）"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ],
+    [
+      2,
+      1,
+      1,
+      4,
+      0,
+      "IMAGE"
+    ],
+    [
+      3,
+      1,
+      2,
+      3,
+      1,
+      "STRING"
+    ],
+    [
+      4,
+      2,
+      0,
+      3,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [
+    {
+      "title": "步骤1：选文件夹 → 看预览",
+      "bounding": [
+        -660,
+        -60,
+        520,
+        780
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "title": "步骤2：设每批几张（下游会自动跑几轮）",
+      "bounding": [
+        -140,
+        -60,
+        520,
+        420
+      ],
+      "color": "#a1309b",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "title": "步骤3：保存",
+      "bounding": [
+        380,
+        -80,
+        480,
+        380
+      ],
+      "color": "#8A8",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

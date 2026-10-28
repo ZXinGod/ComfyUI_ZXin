@@ -1,0 +1,357 @@
+{
+  "last_node_id": 5,
+  "last_link_id": 6,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "ZXIN_BatchImageLoader",
+      "pos": [
+        -660,
+        40
+      ],
+      "size": {
+        "0": 420,
+        "1": 640
+      },
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "图片列表",
+          "type": "IMAGE",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "文件夹预览图",
+          "type": "IMAGE",
+          "links": [
+            2
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "文件名列表",
+          "type": "STRING",
+          "links": [
+            5,
+            6
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "加载数量",
+          "type": "INT",
+          "links": [],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ZXIN_BatchImageLoader",
+        "cnr_id": "zxin-batch-image-tools"
+      },
+      "widgets_values": [
+        "input",
+        "*",
+        "按名称升序",
+        0,
+        0,
+        "仅CPU",
+        true,
+        4,
+        192,
+        ""
+      ],
+      "title": "① 批量图像加载器",
+      "color": "#223"
+    },
+    {
+      "id": 2,
+      "type": "ZXIN_BatchImageDistributor",
+      "pos": [
+        -160,
+        40
+      ],
+      "size": {
+        "0": 400,
+        "1": 260
+      },
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "图片列表",
+          "type": "IMAGE",
+          "link": 1,
+          "slot_index": 0
+        }
+      ],
+      "outputs": [
+        {
+          "name": "批次列表",
+          "type": "IMAGE",
+          "links": [
+            3
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "分批清单",
+          "type": "STRING",
+          "links": [],
+          "slot_index": 0
+        },
+        {
+          "name": "批次数",
+          "type": "INT",
+          "links": [],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ZXIN_BatchImageDistributor",
+        "cnr_id": "zxin-batch-image-tools"
+      },
+      "widgets_values": [
+        4,
+        false
+      ],
+      "title": "② 批次分发器（每批4张 → 20张图自动跑5轮）",
+      "color": "#232"
+    },
+    {
+      "id": 3,
+      "type": "ZXIN_BatchImageAnnotator",
+      "pos": [
+        340,
+        -60
+      ],
+      "size": {
+        "0": 400,
+        "1": 320
+      },
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "图片列表",
+          "type": "IMAGE",
+          "link": 3,
+          "slot_index": 0
+        },
+        {
+          "name": "文件名列表",
+          "type": "STRING",
+          "link": 6,
+          "slot_index": 0
+        }
+      ],
+      "outputs": [
+        {
+          "name": "图像批次",
+          "type": "IMAGE",
+          "links": [
+            4
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ZXIN_BatchImageAnnotator",
+        "cnr_id": "zxin-batch-image-tools"
+      },
+      "widgets_values": [
+        "序号和文件名",
+        "左下角",
+        20,
+        "#FFFFFF",
+        "#000000",
+        null
+      ],
+      "title": "④ 批量角标标注器（每张打上编号和文件名）",
+      "color": "#223"
+    },
+    {
+      "id": 4,
+      "type": "ZXIN_BatchImageSaver",
+      "pos": [
+        340,
+        340
+      ],
+      "size": {
+        "0": 400,
+        "1": 300
+      },
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "图片列表",
+          "type": "IMAGE",
+          "link": 4,
+          "slot_index": 0
+        },
+        {
+          "name": "文件名列表",
+          "type": "STRING",
+          "link": 5,
+          "slot_index": 0
+        }
+      ],
+      "outputs": [
+        {
+          "name": "图像批次",
+          "type": "IMAGE",
+          "links": [],
+          "slot_index": 0
+        },
+        {
+          "name": "已保存文件",
+          "type": "STRING",
+          "links": [],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ZXIN_BatchImageSaver",
+        "cnr_id": "zxin-batch-image-tools"
+      },
+      "widgets_values": [
+        "ZXinBatch",
+        "沿用源文件名",
+        null,
+        true
+      ],
+      "title": "③ 批量保存器",
+      "color": "#322"
+    },
+    {
+      "id": 5,
+      "type": "PreviewImage",
+      "pos": [
+        -160,
+        380
+      ],
+      "size": {
+        "0": 400,
+        "1": 460
+      },
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 2,
+          "slot_index": 0
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage",
+        "cnr_id": "zxin-batch-image-tools"
+      },
+      "widgets_values": [],
+      "title": "文件夹预览图"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ],
+    [
+      2,
+      1,
+      1,
+      5,
+      0,
+      "IMAGE"
+    ],
+    [
+      3,
+      2,
+      0,
+      3,
+      0,
+      "IMAGE"
+    ],
+    [
+      4,
+      3,
+      0,
+      4,
+      0,
+      "IMAGE"
+    ],
+    [
+      5,
+      1,
+      2,
+      4,
+      1,
+      "STRING"
+    ],
+    [
+      6,
+      1,
+      2,
+      3,
+      1,
+      "STRING"
+    ]
+  ],
+  "groups": [
+    {
+      "title": "① 选文件夹 + 看预览图",
+      "bounding": [
+        -700,
+        -60,
+        520,
+        780
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "title": "② 设每批几张：下游自动按轮次跑，只需点一次运行",
+      "bounding": [
+        -200,
+        -60,
+        520,
+        420
+      ],
+      "color": "#a1309b",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "title": "③④ 标注 + 保存",
+      "bounding": [
+        300,
+        -100,
+        500,
+        800
+      ],
+      "color": "#8A8",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

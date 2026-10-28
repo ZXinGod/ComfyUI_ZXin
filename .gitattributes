@@ -1,0 +1,19 @@
+# 统一换行符：仓库内用 LF，检出到 Windows 时由 core.autocrlf 决定
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.cjs   text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.toml  text eol=lf
+*.txt   text eol=lf
+LICENSE text eol=lf
+
+# 二进制
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.zip   binary
+*.pyc   binary

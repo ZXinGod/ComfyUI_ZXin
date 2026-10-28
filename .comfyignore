@@ -1,0 +1,5 @@
+# ComfyUI_ZXin 发布到 Comfy Registry 时排除的文件
+tests/
+.gitignore
+__pycache__/
+*.py[cod]

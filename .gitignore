@@ -1,0 +1,11 @@
+# ComfyUI_ZXin 忽略规则
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.DS_Store
+
+# 打包产物
+*.zip

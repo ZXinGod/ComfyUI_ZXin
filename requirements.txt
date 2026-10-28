@@ -1,0 +1,2 @@
+# ComfyUI_ZXin 依赖
+# 仅使用 ComfyUI 自带环境中的 torch / numpy / Pillow，无需额外安装。
