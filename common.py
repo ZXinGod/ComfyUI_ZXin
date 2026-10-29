@@ -38,13 +38,19 @@ def _output_dir():
         return ""
 
 
-def _safe_walk_subdirs(root):
-    """递归收集 root 下所有子目录（相对路径，正斜杠分隔）。"""
+def _safe_walk_subdirs(root, max_depth=3):
+    """递归收集 root 下所有子目录（相对路径，正斜杠分隔）。
+
+    max_depth 限制往下钻的层数，避免深目录树或网络盘把下拉列表撑爆。
+    """
     out = []
     if not root or not os.path.isdir(root):
         return out
+    root_depth = root.rstrip(os.sep).count(os.sep)
     for cur, dirs, _ in os.walk(root):
         dirs.sort()
+        if cur.rstrip(os.sep).count(os.sep) - root_depth >= max_depth:
+            dirs[:] = []
         for d in dirs:
             rel = os.path.relpath(os.path.join(cur, d), root)
             if rel != ".":
@@ -52,24 +58,49 @@ def _safe_walk_subdirs(root):
     return sorted(out)
 
 
-def root_choices():
+_ROOT_CHOICES_CACHE = {"key": None, "value": None}
+
+
+def root_choices(max_depth=3):
     """生成目录下拉选项：input / output 及其子目录。
 
     形如 "input"、"input/Pose图"、"output/batch_01"。
+    结果按 (根目录, 目录条目数) 做短缓存，避免每次 INPUT_TYPES 都重扫磁盘。
     """
+    key = None
+    try:
+        key = []
+        for base in (_input_dir(), _output_dir()):
+            if base and os.path.isdir(base):
+                key.append((base, len(os.listdir(base))))
+            else:
+                key.append((base, -1))
+        key = tuple(key)
+    except OSError:
+        key = None
+
+    if key is not None and _ROOT_CHOICES_CACHE["key"] == key:
+        return list(_ROOT_CHOICES_CACHE["value"])
+
     choices = []
     for label, base in (("input", _input_dir()), ("output", _output_dir())):
         if not base:
             continue
         choices.append(label)
-        for sub in _safe_walk_subdirs(base):
+        for sub in _safe_walk_subdirs(base, max_depth):
             choices.append(f"{label}/{sub}")
-    return choices or ["input"]
+    choices = choices or ["input"]
+
+    if key is not None:
+        _ROOT_CHOICES_CACHE["key"] = key
+        _ROOT_CHOICES_CACHE["value"] = list(choices)
+    return choices
 
 
 def input_subfolder_choices():
     """只列出 input 目录下的**一级子文件夹**，用于快捷选择。
 
+    保留给外部（含测试）使用；加载节点本身用的是 root_choices() 的完整树。
     返回形如 ["(input 根目录)", "Pose图", "其它图"]。
     """
     base = _input_dir()
@@ -115,31 +146,73 @@ def resolve_root(source, custom_path=""):
     return os.path.abspath(os.path.join(base, rest.replace("/", os.sep))) if rest else os.path.abspath(base)
 
 
-def list_image_files(root, pattern="*"):
-    """列出 root 下匹配 pattern 的图像文件（仅一层，不递归子目录）。
+def list_image_files(root, pattern="*", recursive=False):
+    """列出 root 下匹配 pattern 的图像文件。
 
+    recursive=False（默认）只扫描一层；True 时连子目录一起扫描。
     pattern 支持 glob 语法，例如 "*.png"、"Pose_*"。
     """
     if not root or not os.path.isdir(root):
         return []
     import fnmatch
 
-    try:
-        names = sorted(os.listdir(root))
-    except OSError:
-        return []
+    pat = (pattern or "*").strip() or "*"
+
+    def match(name):
+        return pat == "*" or fnmatch.fnmatch(name, pat)
 
     out = []
-    for name in names:
-        path = os.path.join(root, name)
-        if not os.path.isfile(path):
-            continue
-        if os.path.splitext(name)[1].lower() not in IMAGE_EXTS:
-            continue
-        if pattern and pattern.strip() != "*" and not fnmatch.fnmatch(name, pattern.strip()):
-            continue
-        out.append(path)
+    try:
+        if not recursive:
+            for name in sorted(os.listdir(root)):
+                path = os.path.join(root, name)
+                if not os.path.isfile(path):
+                    continue
+                if os.path.splitext(name)[1].lower() not in IMAGE_EXTS:
+                    continue
+                if match(name):
+                    out.append(path)
+            return out
+
+        for cur, dirs, files in os.walk(root):
+            dirs.sort()
+            for name in sorted(files):
+                if os.path.splitext(name)[1].lower() not in IMAGE_EXTS:
+                    continue
+                if not match(name):
+                    continue
+                out.append(os.path.join(cur, name))
+    except OSError:
+        return []
     return out
+
+
+# 目录扫描缓存：IS_CHANGED 与真正加载会各扫一遍同一个目录，
+# 用「目录 mtime + 条目数」做校验键，命中就复用，省掉一次磁盘遍历。
+_DIR_CACHE = {}
+_DIR_CACHE_MAX = 64
+
+
+def cached_list_images(root, pattern="*", recursive=False):
+    """带缓存的目录扫描；目录内容变化（mtime / 条目数）时自动失效。"""
+    stamp = None
+    try:
+        stamp = (os.stat(root).st_mtime_ns, len(os.listdir(root)))
+    except OSError:
+        stamp = None
+
+    key = (root, pattern, bool(recursive))
+    if stamp is not None:
+        hit = _DIR_CACHE.get(key)
+        if hit is not None and hit[0] == stamp:
+            return list(hit[1])
+
+    paths = list_image_files(root, pattern, recursive)
+    if stamp is not None:
+        if len(_DIR_CACHE) >= _DIR_CACHE_MAX:
+            _DIR_CACHE.clear()
+        _DIR_CACHE[key] = (stamp, list(paths))
+    return paths
 
 
 def sort_files(paths, sort_mode="name_asc", seed=0):
@@ -237,22 +310,45 @@ def pil_to_tensor(img, device, dtype):
     return torch.from_numpy(arr)[None].to(device=device, dtype=dtype)
 
 
-def load_images_varlist(paths, device, dtype):
+def load_images_varlist(paths, device, dtype, max_side=0,
+                        thumb_limit=0, thumb_size=192):
     """按原始尺寸加载多张图片，返回 IMAGE 张量列表。
 
     每张图独立成张量 [1,H,W,C]，**尺寸互不相同也不需要相同**。
     这是分发场景的正确形态：下游节点按列表逐个接收，
     同一节点的多个 image 输入口也可以各自接不同尺寸的图。
+
+    max_side > 0 时把长边等比缩放到不超过该值（防止超大图撑爆内存），
+    max_side = 0 表示完全保留原始尺寸。
+
+    thumb_limit > 0 时额外返回前 thumb_limit 张的缩略图（PIL，长边不超过
+    thumb_size），供预览拼贴复用，避免同一批图片被解码两次。
+
+    返回 (张量列表, 文件名列表, 跳过列表, 缩略图列表[(路径, PIL)])。
     """
-    out, names, skipped = [], [], []
+    out, names, skipped, thumbs = [], [], [], []
     for p in paths:
         img = load_pil(p)
         if img is None:
             skipped.append(os.path.basename(p))
             continue
-        out.append(pil_to_tensor(img.convert("RGB"), device, dtype))
+        img = img.convert("RGB")
+
+        if max_side and max_side > 0:
+            w, h = img.size
+            longest = max(w, h)
+            if longest > max_side:
+                scale = max_side / float(longest)
+                img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), LANCZOS)
+
+        if thumb_limit and len(thumbs) < thumb_limit:
+            thumb = img.copy()
+            thumb.thumbnail((max(1, int(thumb_size)), max(1, int(thumb_size))), LANCZOS)
+            thumbs.append((p, thumb))
+
+        out.append(pil_to_tensor(img, device, dtype))
         names.append(os.path.basename(p))
-    return out, names, skipped
+    return out, names, skipped, thumbs
 
 
 def alpha_to_mask(img, w, h, device, dtype):
@@ -277,27 +373,6 @@ def tensor_to_pil(tensor):
     return Image.fromarray(arr)
 
 
-def interpolate_batch(images, w, h, mode="bicubic"):
-    """用 torch 插值调整整个批次的尺寸（IMAGE 内部使用，优于逐张 PIL 处理）。"""
-    if mode == "nearest-exact":
-        imode = "nearest-exact"
-    elif mode == "area":
-        imode = "area"
-    elif mode == "bilinear":
-        imode = "bilinear"
-    else:
-        imode = "bicubic"
-
-    # [B, H, W, C] → [B, C, H, W]
-    samples = images.movedim(-1, 1)
-    if imode in ("nearest-exact", "area", "bilinear", "bicubic"):
-        kwargs = {"align_corners": False} if imode in ("bilinear", "bicubic") else {}
-        samples = torch.nn.functional.interpolate(samples, size=(h, w), mode=imode, **kwargs)
-    else:
-        samples = torch.nn.functional.interpolate(samples, size=(h, w), mode=imode)
-    return samples.movedim(1, -1)
-
-
 # ---------------------------------------------------------------- 字体
 
 _FONT_CANDIDATES = [
@@ -311,22 +386,36 @@ _FONT_CANDIDATES = [
 ]
 
 
+# 解析成功的字体路径缓存在这里（只是记录，不修改 _FONT_CANDIDATES，
+# 否则每次调用都会往全局候选表头部插入，列表会无限膨胀）
+_RESOLVED_FONT = {"path": None}
+
+
 def find_font(size=16):
     """解析一个可用的 TrueType 字体（优先中文字体），失败回退到内置位图字体。"""
+    candidates = list(_FONT_CANDIDATES)
+
+    # ComfyUI 自带 fonts 目录优先（若存在）
     try:
         import folder_paths
         comfy_fonts = os.path.join(os.path.dirname(os.path.abspath(folder_paths.__file__)), "fonts")
         if os.path.isdir(comfy_fonts):
-            for name in sorted(os.listdir(comfy_fonts)):
-                if name.lower().endswith((".ttf", ".otf", ".ttc")):
-                    _FONT_CANDIDATES.insert(0, os.path.join(comfy_fonts, name))
+            extra = [os.path.join(comfy_fonts, n) for n in sorted(os.listdir(comfy_fonts))
+                     if n.lower().endswith((".ttf", ".otf", ".ttc"))]
+            candidates = extra + candidates
     except Exception:
         pass
 
-    for path in _FONT_CANDIDATES:
+    cached = _RESOLVED_FONT.get("path")
+    if cached:
+        candidates.insert(0, cached)
+
+    for path in candidates:
         if os.path.isfile(path):
             try:
-                return ImageFont.truetype(path, size)
+                font = ImageFont.truetype(path, size)
+                _RESOLVED_FONT["path"] = path
+                return font
             except Exception:
                 continue
     try:
@@ -352,8 +441,11 @@ def draw_label(canvas, text, box_xy, font, fill=(255, 255, 255), bg=(0, 0, 0)):
 
 
 def make_contact_sheet(paths, cols=4, cell=192, gap=6, bg=(24, 24, 24),
-                       label=True, max_items=64):
+                       label=True, max_items=64, preloaded=None):
     """把多张图片拼成一张网格缩略图，用于快速浏览文件夹内容。
+
+    preloaded 传入 [(路径, PIL 缩略图), ...] 时可复用已解码的图片，
+    避免同一批文件被解码两次（加载器刚解过一次的情况）。
 
     返回 (PIL 图像, 拼贴布局信息列表)。单张图读取失败会被跳过。
     布局信息每项为 {"行", "列", "文件名"}，便于核对顺序。
@@ -362,13 +454,17 @@ def make_contact_sheet(paths, cols=4, cell=192, gap=6, bg=(24, 24, 24),
     gap = max(0, int(gap))
     cols = max(1, int(cols))
 
+    cached = {p: img for p, img in (preloaded or [])}
+
     tiles = []
     for path in paths:
         if len(tiles) >= max_items:
             break
-        img = load_pil(path)
+        img = cached.get(path)
         if img is None:
-            continue
+            img = load_pil(path)
+            if img is None:
+                continue
         tiles.append((path, img.convert("RGB")))
 
     if not tiles:
@@ -425,6 +521,15 @@ def device_dtype():
 def safe_json(obj):
     """序列化为 JSON 字符串，无法编码的对象转字符串。"""
     return json.dumps(obj, ensure_ascii=False, default=str)
+
+
+def estimate_memory_mb(shapes):
+    """按 ComfyUI IMAGE 的常驻形态（float32 / 3 通道）估算内存占用（MB）。
+
+    shapes 为 [(宽, 高), ...]。用于加载大目录前给用户一个直观的开销提示。
+    """
+    pixels = sum(int(w) * int(h) for w, h in shapes if w and h)
+    return pixels * 3 * 4 / (1024.0 * 1024.0)
 
 
 def parse_json_list(text):

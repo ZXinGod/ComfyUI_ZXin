@@ -47,8 +47,35 @@ function isTargetNode(node) {
     return cls === TARGET_CLASS;
 }
 
+/** 遍历 graph.links，找出从本节点某个输出槽出发的所有连线目标 */
+function collectLinkTargets(node, slot) {
+    const graph = node?.graph;
+    if (!graph || !graph.links) return [];
+    const targets = [];
+    const push = (link) => {
+        if (link && link.origin_id === node.id && link.origin_slot === slot) {
+            targets.push({ nodeId: link.target_id, slot: link.target_slot });
+        }
+    };
+    try {
+        if (typeof graph.links.forEach === "function" && !Array.isArray(graph.links)) {
+            // Map 形态：values() 才是连线对象
+            for (const link of graph.links.values()) push(link);
+        } else if (Array.isArray(graph.links)) {
+            for (const link of graph.links) push(link);
+        } else {
+            for (const key of Object.keys(graph.links)) push(graph.links[key]);
+        }
+    } catch (e) { /* 忽略遍历失败 */ }
+    return targets;
+}
+
 /**
  * 把输出槽数量调整到 branchCount（不含「分流清单」）。
+ *
+ * 关键点：0.42 前端已废弃「直接给 output.links 赋值」的写法
+ * （会走 deprecated 的 legacy 通道，连线不一定能恢复），
+ * 因此增删槽位后用 node.connect() 重新连线。
  */
 function applyBranchCount(node, branchCount) {
     if (!node || !Array.isArray(node.outputs)) return;
@@ -62,8 +89,10 @@ function applyBranchCount(node, branchCount) {
         manifestIndex = node.outputs.length - 1;
     }
 
-    // 1) 多余的槽位：断开连线后移除（从后往前删，避免索引错位）
-    //    注意只删「分流清单」之前的分支槽
+    // 1) 多余的槽位：先显式断开连线再移除
+    //    removeOutput 在多数 LiteGraph 版本里会自动断线，并把后续槽位
+    //    （含清单）连线的 origin_slot 前移；这里仍显式断一次，
+    //    对不自动断线的实现同样安全（断开是幂等的）。
     for (let i = manifestIndex - 1; i >= want; i--) {
         try {
             node.disconnectOutput?.(i);
@@ -81,15 +110,16 @@ function applyBranchCount(node, branchCount) {
 
     // 2) 不足的槽位：补齐到 want 个
     //    addOutput 只能追加到末尾，所以先把「分流清单」临时摘下，
-    //    补完分支后再挂回去 —— 这样清单始终在最后，且它的连线不丢
-    //    （removeOutput 会断线，因此先记录其连线，补完后恢复）
+    //    补完分支后再挂回去，并用 connect 恢复它原有的连线
     const manifestSlot = node.outputs.find((o) => o.name === MANIFEST_NAME);
     const currentBranchCount = node.outputs.length - (manifestSlot ? 1 : 0);
 
     if (currentBranchCount < want) {
-        let savedLinks = null;
+        const savedTargets = manifestSlot
+            ? collectLinkTargets(node, node.outputs.indexOf(manifestSlot))
+            : [];
+
         if (manifestSlot) {
-            savedLinks = manifestSlot.links ? [...manifestSlot.links] : null;
             try {
                 node.removeOutput(node.outputs.indexOf(manifestSlot));
             } catch (e) {
@@ -106,13 +136,19 @@ function applyBranchCount(node, branchCount) {
         if (manifestSlot) {
             try {
                 node.addOutput(MANIFEST_NAME, "STRING");
-                // 恢复清单槽的连线
-                const newIndex = node.outputs.findIndex((o) => o.name === MANIFEST_NAME);
-                if (newIndex >= 0 && savedLinks && savedLinks.length) {
-                    node.outputs[newIndex].links = savedLinks;
-                }
             } catch (e) {
-                /* 忽略恢复失败 */
+                /* 忽略添加失败 */
+            }
+            const newIndex = node.outputs.findIndex((o) => o.name === MANIFEST_NAME);
+            if (newIndex >= 0 && savedTargets.length) {
+                for (const t of savedTargets) {
+                    try {
+                        const target = node.graph?.getNodeById?.(t.nodeId);
+                        if (target) node.connect(newIndex, target, t.slot);
+                    } catch (e) {
+                        /* 忽略重连失败 */
+                    }
+                }
             }
         }
     }

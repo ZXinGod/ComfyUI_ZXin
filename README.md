@@ -2,33 +2,11 @@
 
 面向 ComfyUI 的批量图像处理节点包：把「加载图像」从单张手工拖拽升级为**目录级批量扫描 → 文件夹预览 → 自动逐批执行 → 批量落盘**的完整链路。
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
 - 目标版本：ComfyUI ≥ 0.3.0（已在 **0.42.0 / Windows 便携版 G313** 实测通过）
+- 当前版本：**v1.1.0**（更新记录见 [CHANGELOG.md](CHANGELOG.md)）
 - 节点契约：V1 Schema（`NODE_CLASS_MAPPINGS`）
 - 界面语言：**全部参数名、输出名、说明均为中文**
 - 额外依赖：**无**，只使用 ComfyUI 自带的 torch / numpy / Pillow
-
----
-
-## 安装
-
-### 方式一：克隆到 custom_nodes（推荐）
-
-```bash
-cd ComfyUI/custom_nodes
-git clone https://github.com/ZXinGod/ComfyUI_ZXin.git
-```
-
-然后重启 ComfyUI。
-
-### 方式二：下载 zip 解压
-
-下载本仓库的 **Code → Download ZIP**，解压后把 `ComfyUI_ZXin` 文件夹放进
-`ComfyUI/custom_nodes/`，然后重启 ComfyUI。
-
-> 目录层级必须是 `ComfyUI/custom_nodes/ComfyUI_ZXin/__init__.py`。
-> 详细步骤与常见问题见 [`安装说明.md`](安装说明.md)。
 
 ---
 
@@ -91,16 +69,18 @@ git clone https://github.com/ZXinGod/ComfyUI_ZXin.git
 
 | 参数 | 说明 |
 | --- | --- |
-| `加载来源` | 目录下拉，含 `input`、`output` 及其**所有子目录**（如 `input/Pose图`），可直接选 input 子文件夹 |
+| `加载来源` | 目录下拉，含 `input`、`output` 及其**子目录**（如 `input/Pose图`），可直接选 input 子文件夹 |
 | `文件名匹配` | 通配符，如 `*.png`、`Pose_*` |
 | `排序方式` | 按名称升序 / 降序、按修改时间新到旧 / 旧到新、随机 |
-| `随机种子` | 随机排序的种子 |
+| `随机种子` | 随机排序的种子。控件上可设「生成后=随机」，每次排队自动换一批 |
 | `最多加载张数` | 最多取几张，`0` = 全部 |
 | `载入设备` | 跟随系统 / 仅CPU（批量大图建议仅CPU） |
 | **`生成预览拼贴`** | 是否生成文件夹预览图（默认开） |
 | **`预览列数`** | 拼贴几列排列 |
 | **`预览单格大小`** | 每格缩略图边长（像素） |
 | `自定义路径` | 任意绝对路径，填写后优先生效 |
+| `含子文件夹` | 是否递归扫描子目录里的图片（默认关 = 只扫一层） |
+| `限制最大边长` | `0` = 完全保留原始尺寸；`>0` 时把长边等比缩放到不超过该值，**防大目录爆内存** |
 
 输出：
 - **`图片列表`** —— 图片列表，每张独立成张并**保留原始尺寸**（尺寸不同也没关系）
@@ -111,6 +91,10 @@ git clone https://github.com/ZXinGod/ComfyUI_ZXin.git
 > **预览图怎么用**：把「文件夹预览图」连到内置的 **PreviewImage（预览图像）** 节点，运行后就能在画布上看到整份拼贴。调「预览列数」和「预览单格大小」让缩略图更清晰。
 >
 > **尺寸不再受限**：加载器**保留每张图的原始尺寸**，不再强制统一。不同分辨率的图混在同一个文件夹里也能正常加载和分发——因为下游是**逐张**接收的，同一节点的多个 image 输入口也可以各自接不同尺寸的图。
+>
+> **内存提示**：加载是**一次性全量载入**的。几百张高分辨率原图会占用大量内存
+> （例如 1000 张 1080p ≈ 24 GB）。加载前会打印预估占用；若内存吃紧，
+> 请调小「最多加载张数」或设置「限制最大边长」。
 
 ### ② 批次分发器（自动逐批执行）
 
@@ -120,21 +104,34 @@ git clone https://github.com/ZXinGod/ComfyUI_ZXin.git
 | --- | --- |
 | `每批输出张数` | 一批输出几张。20 张图 + 每批 4 张 = 5 轮 |
 | `丢弃不足一批的余数` | 最后不足一批时是否丢弃（否则最后一批会短一些） |
+| `变尺寸处理方式` | 批内图片**尺寸不一致**时怎么办（见下表） |
 
 输出只有 3 个：
 
 | 输出 | 类型 | 说明 |
 | --- | --- | --- |
 | `批次列表` | IMAGE | **要接到下游的那个口**。里面装着若干批，按顺序排好 |
-| `分批清单` | STRING | JSON，记录每批张数、批次数、总张数与各批索引区间 |
-| `批次数` | INT | 一共几批 |
+| `分批清单` | STRING | JSON，记录分组数、执行轮数、每批张数与各批尺寸 |
+| `执行轮数` | INT | 下游实际会被调度几次 |
 
 > **`批次列表` 里究竟是什么？**
-> 例：20 张图、每批 4 张 →
+> 例：20 张图、每批 4 张（尺寸一致）→
 > `批次列表` = [ [图1~图4], [图5~图8], [图9~图12], [图13~图16], [图17~图20] ]
 > 下游节点接到这个口，会被自动调用 **5 次**：第 1 次收到图1~图4，第 2 次收到图5~图8……
->
-> **批内尺寸可以不同**：每批里的图各自保持原始尺寸。批内尺寸恰好一致时会自动合并成一个张量（下游处理更快），不一致时保持独立逐张传递。
+
+#### 批内尺寸不一致时怎么办
+
+一个 IMAGE 端口一次只能接收**一个张量**，而张量要求批内 H/W 相同，
+所以「一批里装着不同尺寸的图」在 ComfyUI 里物理上无法直接成立。
+用 `变尺寸处理方式` 选择取舍：
+
+| 选项 | 一批 N 张会跑几轮 | 尺寸 | 适用 |
+| --- | --- | --- | --- |
+| **逐张单独执行（保留原始尺寸）**（默认） | N 轮，每轮 1 张 | **完全不动，原样保留** | 要保持原分辨率的场景 |
+| 留白统一到批内最大尺寸 | 1 轮 N 张 | 等比缩放后补黑边，统一成批内最大尺寸 | 能接受黑边、想少跑几轮 |
+| 等比裁切到批内最小尺寸 | 1 轮 N 张 | 等比缩放后居中裁切，统一成批内最小尺寸 | 能接受裁掉边缘 |
+
+批内尺寸**恰好一致**时不受影响：自动拼成一个 `[N,H,W,3]` 张量，仍是 1 轮 N 张。
 
 ### ③ 并行分发器（可调分支数）
 
@@ -207,6 +204,9 @@ git clone https://github.com/ZXinGod/ComfyUI_ZXin.git
 1. 加载器 `加载来源` 选 `input/Pose图`（或任意子目录）。
 2. 分发器 `每批输出张数` 填 4 → 20 张图自动跑 5 轮。
 3. 保存器接加载器的 `文件名列表` → 落盘文件名与源文件一一对应。
+4. **图尺寸不一致时**：分发器默认「逐张单独执行」，一批 4 张会跑 4 轮、
+   每轮 1 张，尺寸原样保留。想保持「一轮 4 张」就把 `变尺寸处理方式`
+   改成留白统一或等比裁切（代价是尺寸会被统一）。
 
 ### 先预览再决定
 
@@ -231,20 +231,50 @@ git clone https://github.com/ZXinGod/ComfyUI_ZXin.git
 
 ---
 
+## 升级说明
+
+本次修复涉及**控件增删**。ComfyUI 前端的 `widgets_values` 是**按位置**赋值的，
+因此新增控件一律**追加在末尾**（加载器的 `含子文件夹` / `限制最大边长`，
+分发器的 `变尺寸处理方式`），旧工作流打开时前面已有的控件值不会错位，
+新控件取默认值，行为与升级前一致。
+
+行为上有两处变化需要注意：
+
+1. **分发器输出结构修正**（重要 bug 修复）：此前每个元素多套了一层 list，
+   导致下游标准节点（KSampler / VAEEncode / SaveImage 等）会报
+   `TypeError: unsupported operand type(s) for -: 'float' and 'list'`。
+   现在每个元素是张量本身，接任何节点都能跑。
+2. 分发器第 3 个输出改名 `执行轮数`，含义改为**下游实际会被调度几次**
+   （变尺寸逐张时会大于分组批次数）。`分批清单` 里两个数字都有。
+
+---
+
 ## 运行测试
 
 ```bash
-cd D:/AI/ComfyUI_windows_portable-G313/ComfyUI/custom_nodes
-../python_embeded/python.exe ComfyUI_ZXin/tests/test_nodes.py
+# 在你的 ComfyUI 目录下运行即可。
+# 脚本会用 tests/comfy_paths.py 自动探测 ComfyUI 位置（环境变量 → custom_nodes 父目录 → 常见安装位置），
+# 无需硬编码任何人的绝对路径。
+cd /path/to/ComfyUI
+python_embeded/python.exe custom_nodes/ComfyUI_ZXin/tests/test_nodes.py
 ```
 
-覆盖 32 项检查：注册表完整性、V1 契约、**参数中文化校验**、4 个节点的功能冒烟、**多轮自动执行链路验证**、**预览拼贴尺寸校验**、空批次 / 非法维度 / 目录不存在 / 单张图等边界。
+> 若自动探测失败（例如 ComfyUI 装在非常规位置），用环境变量指定即可：
+> `COMFY_ROOT=/your/ComfyUI python_embeded/python.exe custom_nodes/ComfyUI_ZXin/tests/test_nodes.py`
+
+覆盖 42 项检查：注册表完整性、V1 契约、**参数中文化校验**、5 个节点的功能冒烟、
+**多轮自动执行链路验证**、**核心节点兼容性回归**（用真实执行引擎把分发结果喂给
+`ImageInvert`）、**预览拼贴尺寸校验**、递归扫描、限制最大边长、VALIDATE_INPUTS、
+字体候选表稳定性、目录扫描缓存，以及空批次 / 非法维度 / 目录不存在 / 单张图等边界。
+
+> 测试会在 `input/_zxin_test`、`output/ZXin*` 下建临时文件，跑完建议自行清理。
 
 ---
 
 ## 发布到 Comfy Registry
 
-`pyproject.toml` 已按官方规范写好，发布前需替换占位符：
+`pyproject.toml` 已按官方规范写好，`Repository` 与 `PublisherId` 已填为 `ZXinGod`。
+换账号发布时替换这两处即可：
 
 - `project.name` → 你的唯一节点 ID（不能含 `ComfyUI`，不能以数字开头）
 - `[project.urls] Repository` → 仓库地址
@@ -266,6 +296,7 @@ ComfyUI_ZXin/
 ├── pyproject.toml           # Registry 打包元数据
 ├── requirements.txt         # 无额外依赖
 ├── LICENSE                  # MIT
+├── CHANGELOG.md             # 版本更新记录
 ├── 安装说明.md              # 换机部署步骤（解压即用）
 ├── js/
 │   └── dynamic_branch_outputs.js   # 前端扩展：动态增减输出端口
@@ -276,7 +307,7 @@ ComfyUI_ZXin/
 ├── tools/
 │   └── make_example_workflows.py   # 示例工作流生成脚本
 └── tests/
-    ├── test_nodes.py                 # 32 项真机验证
+    ├── test_nodes.py                 # 42 项真机验证
     ├── test_dynamic_outputs.mjs      # 前端扩展单元测试
     ├── validate_workflows.py         # 示例工作流连线校验
     ├── verify_web_extension.py       # WEB_DIRECTORY 注册校验

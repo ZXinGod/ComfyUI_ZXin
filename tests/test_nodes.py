@@ -82,7 +82,8 @@ def clean_output_artifacts():
     if not os.path.isdir(out_dir):
         return
     for name in os.listdir(out_dir):
-        if name.startswith(("ZXinTest", "ZXinOrig", "ZXinDup", "alpha", "beta")) and name.lower().endswith(".png"):
+        if name.startswith(("ZXinTest", "ZXinOrig", "ZXinDup", "ZXinVar",
+                            "ZXinUI", "ZXinSize", "alpha", "beta")) and name.lower().endswith(".png"):
             try:
                 os.remove(os.path.join(out_dir, name))
             except OSError:
@@ -221,6 +222,12 @@ def main():
     import torch
     mapping = pkg.NODE_CLASS_MAPPINGS
 
+    def unwrap(out):
+        """保存器可能返回 {"ui":..., "result":...} 或普通 tuple，统一取输出部分。"""
+        if isinstance(out, dict):
+            return out["result"]
+        return out
+
     def test_loader():
         """加载器保留原始尺寸，以列表输出。"""
         node = mapping["ZXIN_BatchImageLoader"]()
@@ -300,52 +307,83 @@ def main():
     check("加载器支持 input 子文件夹选择", test_loader_subfolder_choice)
 
     def test_distributor_list_mode():
-        """列表模式：20 张 / 每批 4 张 → 5 批。"""
+        """列表模式：20 张 / 每批 4 张（同尺寸）→ 5 批，每批一个张量。"""
         node = mapping["ZXIN_BatchImageDistributor"]()
-        # 模拟加载器输出：20 张独立张量（尺寸可不同）
-        imgs = [torch.rand(1, 16 + i, 16 + i, 3) for i in range(20)]
+        imgs = [torch.rand(1, 32, 32, 3) for _ in range(20)]
         out = node.distribute(imgs, 4, False)
         batches = out[0]
-        assert isinstance(batches, list), "第1批输出必须是 list"
-        assert len(batches) == 5, f"批次数错误: {len(batches)}"
-        assert out[2] == 5, f"批次数输出错误: {out[2]}"
+        assert isinstance(batches, list), "输出必须是 list"
+        assert len(batches) == 5, f"执行轮数错误: {len(batches)}"
+        assert out[2] == 5, f"执行轮数输出错误: {out[2]}"
         manifest = json.loads(out[1])
-        assert manifest["批次数"] == 5 and manifest["总张数"] == 20, f"清单异常: {manifest}"
-        # 顺序必须保持：第1批应是前4张
-        first = batches[0]
-        assert isinstance(first, list), "每批必须是 list"
-        # 变尺寸时每批保持 4 个独立元素；同尺寸时合并为 1 个 [4,H,W,C] 张量
-        assert len(first) in (1, 4), f"第1批结构异常: {len(first)}"
-        print(f"    20 张 → 每批 4 张 → {len(batches)} 批，顺序正确")
+        assert manifest["分组批次数"] == 5 and manifest["总张数"] == 20, f"清单异常: {manifest}"
+        # 关键：每个元素必须是【张量】，不能是 list（否则下游标准节点会报错）
+        for i, b in enumerate(batches):
+            assert isinstance(b, torch.Tensor), f"第{i + 1}轮不是张量而是 {type(b)}"
+            assert b.shape[0] == 4, f"第{i + 1}轮张数错误: {b.shape}"
+        print(f"    20 张 → 每批 4 张 → {len(batches)} 轮，每轮张量 4 张")
 
-    check("批次分发器 (列表模式 20→5批)", test_distributor_list_mode)
+    check("批次分发器 (同尺寸 20→5轮)", test_distributor_list_mode)
 
     def test_distributor_varlist():
-        """关键：不同尺寸的图可以正常分组，不报错。"""
+        """核心诉求：不同尺寸的图完整保留原始尺寸，逐张单独执行。"""
         node = mapping["ZXIN_BatchImageDistributor"]()
         imgs = [torch.rand(1, 10 + i * 7, 20 + i * 5, 3) for i in range(12)]
         out = node.distribute(imgs, 4, False)
-        batches = out[0]
-        assert len(batches) == 3, f"批次数错误: {len(batches)}"
-        # 每批内尺寸不同 → 保持为独立的 list 元素，不强行 cat
-        for bi, batch in enumerate(batches):
-            assert isinstance(batch, list), f"第{bi + 1}批应为 list"
-            assert len(batch) == 4, f"第{bi + 1}批张数错误: {len(batch)}"
-        print("    变尺寸图片分组正常，批内尺寸不强制统一")
+        rounds = out[0]
+        # 12 张尺寸各不相同 → 逐张执行，共 12 轮
+        assert len(rounds) == 12, f"执行轮数错误: {len(rounds)}"
+        for i, t in enumerate(rounds):
+            assert isinstance(t, torch.Tensor), f"第{i + 1}轮不是张量: {type(t)}"
+            assert t.shape[0] == 1, f"第{i + 1}轮应只有 1 张: {t.shape}"
+        # 尺寸必须与原始输入逐一对应（没有被缩放/留白）
+        for i, t in enumerate(rounds):
+            assert tuple(t.shape[1:3]) == (10 + i * 7, 20 + i * 5), \
+                f"第{i + 1}张尺寸被改动: {tuple(t.shape[1:3])}"
+        manifest = json.loads(out[1])
+        assert manifest["分组批次数"] == 3 and manifest["执行轮数"] == 12, f"清单异常: {manifest}"
+        print(f"    12 张不同尺寸 → {len(rounds)} 轮，每张原始尺寸完整保留")
 
-    check("批次分发器 (变尺寸图片分组)", test_distributor_varlist)
+    check("批次分发器 (变尺寸逐张保留原始尺寸)", test_distributor_varlist)
+
+    def test_distributor_varsize_pad():
+        """变尺寸也可选择留白统一，保持一轮多张。"""
+        node = mapping["ZXIN_BatchImageDistributor"]()
+        imgs = [torch.rand(1, 10, 20, 3), torch.rand(1, 30, 40, 3),
+                torch.rand(1, 20, 10, 3), torch.rand(1, 40, 30, 3)]
+        out = node.distribute(imgs, 4, False,
+                              变尺寸处理方式="留白统一到批内最大尺寸")
+        rounds = out[0]
+        assert len(rounds) == 1, f"留白统一后应只有 1 轮: {len(rounds)}"
+        assert isinstance(rounds[0], torch.Tensor), "输出必须是张量"
+        assert rounds[0].shape == (4, 40, 40, 3), f"统一尺寸错误: {rounds[0].shape}"
+        print(f"    留白统一 → 1 轮 {tuple(rounds[0].shape)}")
+
+    check("批次分发器 (变尺寸留白统一)", test_distributor_varsize_pad)
+
+    def test_distributor_varsize_cover():
+        node = mapping["ZXIN_BatchImageDistributor"]()
+        imgs = [torch.rand(1, 10, 20, 3), torch.rand(1, 30, 40, 3),
+                torch.rand(1, 20, 10, 3), torch.rand(1, 40, 30, 3)]
+        out = node.distribute(imgs, 4, False,
+                              变尺寸处理方式="等比裁切到批内最小尺寸")
+        rounds = out[0]
+        assert len(rounds) == 1, f"裁切统一后应只有 1 轮: {len(rounds)}"
+        assert rounds[0].shape == (4, 10, 10, 3), f"裁切尺寸错误: {rounds[0].shape}"
+        print(f"    等比裁切 → 1 轮 {tuple(rounds[0].shape)}")
+
+    check("批次分发器 (变尺寸等比裁切)", test_distributor_varsize_cover)
 
     def test_distributor_same_size_merged():
         """同尺寸的批会合并成张量，下游处理更高效。"""
         node = mapping["ZXIN_BatchImageDistributor"]()
         imgs = [torch.rand(1, 32, 32, 3) for _ in range(8)]
         out = node.distribute(imgs, 4, False)
-        batches = out[0]
-        assert len(batches) == 2, f"批次数错误: {len(batches)}"
-        # 同尺寸时每批为 [tensor] 形式（长度1，内含 [4,H,W,C]）
-        assert len(batches[0]) == 1, f"同尺寸批应合并为单张量: {len(batches[0])}"
-        assert batches[0][0].shape[0] == 4, f"合并后张量张数错误: {batches[0][0].shape}"
-        print("    同尺寸批次自动合并为张量")
+        rounds = out[0]
+        assert len(rounds) == 2, f"轮数错误: {len(rounds)}"
+        assert isinstance(rounds[0], torch.Tensor), "每轮必须是张量"
+        assert rounds[0].shape[0] == 4, f"合并后张数错误: {rounds[0].shape}"
+        print("    同尺寸批次自动合并为 [4,H,W,3] 张量")
 
     check("批次分发器 (同尺寸自动合并)", test_distributor_same_size_merged)
 
@@ -353,11 +391,52 @@ def main():
         node = mapping["ZXIN_BatchImageDistributor"]()
         imgs = [torch.rand(1, 16, 16, 3) for _ in range(20)]
         out = node.distribute(imgs, 6, True)
-        batches = out[0]
-        assert len(batches) == 3, f"丢弃余数后批次数错误: {len(batches)}"
-        print(f"    20 张 / 每批 6 张 / 丢弃余数 → {len(batches)} 批")
+        rounds = out[0]
+        assert len(rounds) == 3, f"丢弃余数后轮数错误: {len(rounds)}"
+        print(f"    20 张 / 每批 6 张 / 丢弃余数 → {len(rounds)} 轮")
 
     check("批次分发器 (丢弃余数)", test_distributor_drop_last)
+
+    def test_distributor_core_node_compatible():
+        """P0 回归：分发器输出必须能被 ComfyUI【核心节点】直接消费。
+
+        用真实引擎的 merge_result_data + _async_map_node_over_list 把输出喂给
+        核心 ImageInvert。此前输出多套了一层 list，这里必然 TypeError。
+        """
+        from execution import _async_map_node_over_list, merge_result_data
+
+        try:
+            import nodes as core_nodes
+            target, func, extra = core_nodes.ImageInvert(), "invert", {}
+        except Exception as e:  # pragma: no cover - 环境缺少核心节点时跳过
+            raise AssertionError(f"无法加载核心节点: {e}")
+
+        dist = mapping["ZXIN_BatchImageDistributor"]()
+
+        async def feed(imgs, **kw):
+            ret = dist.distribute(imgs, 4, False, **kw)
+            slot = merge_result_data([list(ret)], dist)[0]
+            return await _async_map_node_over_list(
+                prompt_id="t", unique_id="1", obj=target,
+                input_data_all={"image": slot, **extra}, func=func,
+                allow_interrupt=False)
+
+        # 同尺寸：5 轮，每轮 [4,H,W,3]
+        same = [torch.rand(1, 32, 32, 3) for _ in range(20)]
+        res = asyncio.run(feed(same))
+        assert len(res) == 5, f"同尺寸应跑 5 轮: {len(res)}"
+        assert tuple(res[0][0].shape) == (4, 32, 32, 3), f"输出形状错误: {res[0][0].shape}"
+
+        # 变尺寸：12 轮，每轮 [1,H,W,3] 且各自原始尺寸
+        var = [torch.rand(1, 10 + i * 7, 20 + i * 5, 3) for i in range(12)]
+        res = asyncio.run(feed(var))
+        assert len(res) == 12, f"变尺寸应跑 12 轮: {len(res)}"
+        for i, r in enumerate(res):
+            assert tuple(r[0].shape) == (1, 10 + i * 7, 20 + i * 5, 3), \
+                f"第{i + 1}轮尺寸错误: {tuple(r[0].shape)}"
+        print("    核心 ImageInvert 成功消费：同尺寸 5 轮 / 变尺寸 12 轮")
+
+    check("分发器输出可被核心节点消费 (P0 回归)", test_distributor_core_node_compatible)
 
     def test_splitter_four_branch():
         """并行分发器：轮流分到 4 个分支，各接一个不同节点。"""
@@ -496,17 +575,17 @@ def main():
         assert len(images) == 20, f"加载数量错误: {len(images)}"
 
         dist_out = dist.distribute(images, 4, False)
-        batches = dist_out[0]
-        assert len(batches) == 5, f"批次数错误: {len(batches)}"
+        rounds = dist_out[0]
+        assert len(rounds) == 20, f"变尺寸应逐张执行 20 轮: {len(rounds)}"
 
-        # 每批内的图尺寸仍然各自保留
-        shapes = set()
-        for batch in batches:
-            for t in (batch if isinstance(batch, list) else [batch]):
-                if t.ndim == 4 and t.shape[0] == 1:
-                    shapes.add(tuple(t.shape[1:3]))
+        # 每张图的原始尺寸都必须完整保留（逐像素不被缩放/留白）
+        for i, t in enumerate(rounds):
+            assert isinstance(t, torch.Tensor), f"第{i + 1}轮不是张量: {type(t)}"
+            assert tuple(t.shape[1:3]) == tuple(images[i].shape[1:3]), \
+                f"第{i + 1}张尺寸被改动: {tuple(t.shape[1:3])}"
+        shapes = {tuple(t.shape[1:3]) for t in rounds}
         assert len(shapes) > 1, f"变尺寸信息丢失: {shapes}"
-        print(f"    加载 {len(images)} 张 → 分发 {len(batches)} 批，保留 {len(shapes)} 种原始尺寸")
+        print(f"    加载 {len(images)} 张 → 分发 {len(rounds)} 轮，保留 {len(shapes)} 种原始尺寸")
 
     check("变尺寸端到端链路 (加载→分发)", test_varlist_end_to_end)
 
@@ -570,7 +649,7 @@ def main():
             文件名列表='["a.png", "b.jpg", "c.png"]', 写入元数据=True,
             prompt={"1": {"class_type": "Test"}}, extra_pnginfo={"workflow": {"nodes": []}},
         )
-        files = json.loads(out[1])
+        files = json.loads(unwrap(out)[1])
         assert len(files) == 3, f"保存数量错误: {len(files)}"
         for rel in files:
             full = os.path.join(COMFY_ROOT, "output", rel)
@@ -587,7 +666,7 @@ def main():
             图片列表=imgs, 文件名前缀="ZXinVar", 命名方式="按序号",
             文件名列表="", 写入元数据=False,
         )
-        files = json.loads(out[1])
+        files = json.loads(unwrap(out)[1])
         assert len(files) == 4, f"变尺寸保存数量错误: {len(files)}"
         for rel in files:
             assert os.path.exists(os.path.join(COMFY_ROOT, "output", rel)), f"未落盘: {rel}"
@@ -602,7 +681,7 @@ def main():
             图片列表=imgs, 文件名前缀="ZXinOrig", 命名方式="沿用源文件名",
             文件名列表='["alpha.png", "beta.png"]', 写入元数据=False,
         )
-        files = json.loads(out[1])
+        files = json.loads(unwrap(out)[1])
         assert "alpha.png" in files[0], f"未沿用源文件名: {files[0]}"
         assert "beta.png" in files[1], f"未沿用源文件名: {files[1]}"
         print(f"    沿用源文件名: {files}")
@@ -621,8 +700,8 @@ def main():
             图片列表=imgs, 文件名前缀="ZXinDup", 命名方式="按序号",
             文件名列表="", 写入元数据=False,
         )
-        f1 = json.loads(out1[1])[0]
-        f2 = json.loads(out2[1])[0]
+        f1 = json.loads(unwrap(out1)[1])[0]
+        f2 = json.loads(unwrap(out2)[1])[0]
         assert f1 != f2, f"第二次保存覆盖了原文件: {f1} == {f2}"
         assert os.path.exists(os.path.join(COMFY_ROOT, "output", f1)), "原文件丢失"
         assert os.path.exists(os.path.join(COMFY_ROOT, "output", f2)), "新文件未生成"
@@ -714,17 +793,137 @@ def main():
     check("不存在的目录被拦截", test_missing_dir)
 
     def test_single_batch_edge():
-        """只有 1 张图时，列表模式应只产出 1 批。"""
+        """只有 1 张图时，列表模式应只产出 1 轮。"""
         node = mapping["ZXIN_BatchImageDistributor"]()
         imgs = [torch.rand(1, 16, 16, 3)]
         out = node.distribute(imgs, 4, False)
-        assert len(out[0]) == 1, f"单图应产出 1 批: {len(out[0])}"
+        assert len(out[0]) == 1, f"单图应产出 1 轮: {len(out[0])}"
         first = out[0][0]
-        assert len(first) == 1, "单图批次应有 1 个元素"
-        assert first[0].shape[0] == 1, "单图批次张数错误"
-        print("    单张图 → 1 批")
+        assert isinstance(first, torch.Tensor), "单图输出必须是张量"
+        assert first.shape[0] == 1, "单图批次张数错误"
+        print("    单张图 → 1 轮")
 
     check("单张图边界", test_single_batch_edge)
+
+    def test_loader_recursive():
+        """「含子文件夹」应能递归扫描到子目录里的图片。"""
+        sub = os.path.join(tmp_input, "sub")
+        make_test_images(sub, count=3, size=(64, 64))
+        node = mapping["ZXIN_BatchImageLoader"]()
+        flat = node.load_batch(
+            加载来源="input/_zxin_test", 文件名匹配="*.png", 排序方式="按名称升序",
+            随机种子=0, 最多加载张数=0, 载入设备="仅CPU",
+            生成预览拼贴=False, 预览列数=4, 预览单格大小=128, 自定义路径="",
+            含子文件夹=False, 限制最大边长=0,
+        )
+        rec = node.load_batch(
+            加载来源="input/_zxin_test", 文件名匹配="*.png", 排序方式="按名称升序",
+            随机种子=0, 最多加载张数=0, 载入设备="仅CPU",
+            生成预览拼贴=False, 预览列数=4, 预览单格大小=128, 自定义路径="",
+            含子文件夹=True, 限制最大边长=0,
+        )
+        assert len(flat[0]) == 20, f"非递归应为 20 张: {len(flat[0])}"
+        assert len(rec[0]) == 23, f"递归应额外拿到子目录 3 张: {len(rec[0])}"
+        print(f"    非递归 {len(flat[0])} 张 → 递归 {len(rec[0])} 张")
+
+    check("批量加载器 (含子文件夹递归)", test_loader_recursive)
+
+    def test_loader_max_side():
+        """「限制最大边长」应等比缩放且不改变宽高比。"""
+        node = mapping["ZXIN_BatchImageLoader"]()
+        out = node.load_batch(
+            加载来源="input/_zxin_test", 文件名匹配="*.png", 排序方式="按名称升序",
+            随机种子=0, 最多加载张数=4, 载入设备="仅CPU",
+            生成预览拼贴=False, 预览列数=4, 预览单格大小=128, 自定义路径="",
+            含子文件夹=False, 限制最大边长=64,
+        )
+        for t in out[0]:
+            assert max(t.shape[1], t.shape[2]) <= 64, f"长边未被限制: {tuple(t.shape[1:3])}"
+        print(f"    限制最大边长=64 → 各图 {[tuple(t.shape[1:3]) for t in out[0]]}")
+
+    check("批量加载器 (限制最大边长)", test_loader_max_side)
+
+    def test_loader_validate_inputs():
+        """路径非法时应在排队阶段就被 VALIDATE_INPUTS 拦下。"""
+        cls = mapping["ZXIN_BatchImageLoader"]
+        ok = cls.VALIDATE_INPUTS("input/_zxin_test", "", "*", 0)
+        assert ok is True, f"合法路径应通过校验: {ok}"
+        bad = cls.VALIDATE_INPUTS("input", os.path.join(COMFY_ROOT, "input", "__nope__"), "*", 0)
+        assert bad is not True, "不存在的自定义路径应被拦截"
+        print(f"    非法路径拦截: {bad}")
+
+    check("批量加载器 (VALIDATE_INPUTS)", test_loader_validate_inputs)
+
+    def test_font_candidates_not_growing():
+        """find_font 不得污染全局候选表（否则每调用一次列表就变长）。"""
+        from ComfyUI_ZXin.common import _FONT_CANDIDATES, find_font
+        before = len(_FONT_CANDIDATES)
+        for _ in range(5):
+            find_font(20)
+        assert len(_FONT_CANDIDATES) == before, \
+            f"候选表被污染: {before} → {len(_FONT_CANDIDATES)}"
+        print(f"    字体候选表稳定在 {before} 项")
+
+    check("字体候选表不被污染", test_font_candidates_not_growing)
+
+    def test_saver_ui_result():
+        """保存器应回传 ui 预览（同时保留输出）。"""
+        from ComfyUI_ZXin.nodes import supports_result_ui
+        node = mapping["ZXIN_BatchImageSaver"]()
+        imgs = [torch.rand(1, 24, 24, 3), torch.rand(1, 40, 30, 3)]
+        out = node.save_batch(
+            图片列表=imgs, 文件名前缀="ZXinUI", 命名方式="按序号",
+            文件名列表="", 写入元数据=False,
+        )
+        if supports_result_ui():
+            assert isinstance(out, dict) and "ui" in out, f"应回传 ui: {type(out)}"
+            assert len(out["ui"]["images"]) == 2, "ui 预览数量错误"
+            saved = json.loads(out["result"][1])
+        else:
+            saved = json.loads(out[1])
+        assert len(saved) == 2, f"保存数量错误: {len(saved)}"
+        print(f"    保存 2 张，ui 回传 {supports_result_ui()}")
+
+    check("批量保存器 (ui 预览回传)", test_saver_ui_result)
+
+    def test_saver_varsize_subfolder():
+        """变尺寸时每张按自身尺寸归类到对应的 %width%x%height% 目录。"""
+        node = mapping["ZXIN_BatchImageSaver"]()
+        imgs = [torch.rand(1, 20, 30, 3), torch.rand(1, 40, 50, 3)]
+        out = node.save_batch(
+            图片列表=imgs, 文件名前缀="ZXinSize/%width%x%height%/img", 命名方式="按序号",
+            文件名列表="", 写入元数据=False,
+        )
+        files = json.loads(unwrap(out)[1])
+        assert len(files) == 2, f"保存数量错误: {len(files)}"
+        dirs = {os.path.dirname(f.replace("\\", "/")) for f in files}
+        assert dirs == {"ZXinSize/30x20", "ZXinSize/50x40"}, \
+            f"未按各自尺寸归类: {sorted(dirs)}"
+        print(f"    变尺寸分别落到: {sorted(dirs)}")
+
+    check("批量保存器 (变尺寸各自归类)", test_saver_varsize_subfolder)
+
+    def test_directory_scan_cache():
+        """目录扫描缓存应在内容变化时失效，避免 IS_CHANGED 与加载各扫一遍。"""
+        from ComfyUI_ZXin.common import cached_list_images
+        a = cached_list_images(tmp_input, "*.png", False)
+        b = cached_list_images(tmp_input, "*.png", False)
+        assert a == b and len(a) == 20, f"缓存结果异常: {len(a)}"
+        extra = os.path.join(tmp_input, "cache_probe.png")
+        from PIL import Image
+        Image.new("RGB", (8, 8)).save(extra)
+        try:
+            # 目录条目数变化 → 缓存必须失效
+            for _ in range(50):
+                if len(cached_list_images(tmp_input, "*.png", False)) == 21:
+                    break
+                os.utime(tmp_input, None)
+            assert len(cached_list_images(tmp_input, "*.png", False)) == 21, "缓存未失效"
+        finally:
+            os.remove(extra)
+        print("    目录扫描缓存命中且能正确失效")
+
+    check("目录扫描缓存有效性", test_directory_scan_cache)
 
     # ---------------------------------------------------------- 汇总
     print("\n" + "=" * 68)
