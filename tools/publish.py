@@ -414,11 +414,21 @@ def step_push(args, tag):
 
 def step_verify(args):
     say("▸ 验证")
-    _, out, _ = run(["git", "ls-remote", "origin"], check=False)
-    tags = [l.split()[-1] for l in out.splitlines()]
+    _, out, _ = run(["git", "ls-remote", "--tags", "origin"], check=False)
+    # refs/tags/v1.3.0^{} 是 annotated tag 的剥离标记，不是 tag 本身
+    tags = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        ref = parts[1]
+        if ref.endswith("^{}"):
+            continue
+        if ref.startswith("refs/tags/"):
+            tags.append(ref[len("refs/tags/"):])
     if args.tag:
         say(f"    远端 tag {args.tag}：{'存在 ✓' if args.tag in tags else '缺失 ✗'}")
-    say(f"    远端 tags：{', '.join(t for t in tags if t.startswith('v'))}")
+    say(f"    远端 tags：{', '.join(t for t in tags if t.startswith('v')) or '（无）'}")
 
 
 # ────────────────────────────── 入口 ──────────────────────────────
@@ -472,7 +482,10 @@ def main():
     step_verify(args)
 
     say("\n" + "═" * 62)
-    say(f"  ✓ 发布完成  →  https://github.com/{args.repo}/releases/tag/{args.tag or 'main'}")
+    if args.tag and not args.no_release:
+        say(f"  ✓ 发布完成  →  https://github.com/{args.repo}/releases/tag/{args.tag}")
+    else:
+        say(f"  ✓ 已推送  →  https://github.com/{args.repo}/commits/main")
     say("═" * 62)
 
 
