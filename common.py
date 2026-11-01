@@ -461,11 +461,15 @@ def draw_label(canvas, text, box_xy, font, fill=(255, 255, 255), bg=(0, 0, 0)):
 
 
 def make_contact_sheet(paths, cols=4, cell=192, gap=6, bg=(24, 24, 24),
-                       label=True, max_items=64, preloaded=None):
+                       label=True, max_items=None, preloaded=None):
     """把多张图片拼成一张网格缩略图，用于快速浏览文件夹内容。
 
     preloaded 传入 [(路径, PIL 缩略图), ...] 时可复用已解码的图片，
     避免同一批文件被解码两次（加载器刚解过一次的情况）。
+
+    max_items 为 None 时不限制拼贴张数；大于 0 时最多拼这么多张。
+    **不要在这里写死上限** —— 上限应由调用方按实际加载量与内存预算决定，
+    否则会出现「设了最多加载 100 张、预览却只有 64 张」这类不一致。
 
     返回 (PIL 图像, 拼贴布局信息列表)。单张图读取失败会被跳过。
     布局信息每项为 {"行", "列", "文件名"}，便于核对顺序。
@@ -473,12 +477,13 @@ def make_contact_sheet(paths, cols=4, cell=192, gap=6, bg=(24, 24, 24),
     cell = max(32, int(cell))
     gap = max(0, int(gap))
     cols = max(1, int(cols))
+    limit = None if max_items is None else max(0, int(max_items))
 
     cached = {p: img for p, img in (preloaded or [])}
 
     tiles = []
     for path in paths:
-        if len(tiles) >= max_items:
+        if limit is not None and len(tiles) >= limit:
             break
         img = cached.get(path)
         if img is None:

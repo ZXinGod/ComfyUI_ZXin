@@ -756,6 +756,81 @@ def main():
 
     check("关闭预览拼贴不报错", test_preview_disabled)
 
+    def test_preview_no_hidden_limit():
+        """预览拼贴张数必须跟随实际加载量，不能有写死的上限（如曾经的 64）。"""
+        node = mapping["ZXIN_BatchImageLoader"]()
+        # 造 70 张图（>64），验证预览不再是 64 张
+        import tempfile
+        from PIL import Image as _PILImage
+        tmp = tempfile.mkdtemp(prefix="zxin_preview_")
+        try:
+            for i in range(70):
+                _PILImage.new("RGB", (40, 40), (i % 255, 90, 160)).save(
+                    os.path.join(tmp, "p_%03d.png" % i))
+            out = node.load_batch(
+                加载来源="input/_zxin_test", 文件名匹配="*.png", 排序方式="按名称升序",
+                随机种子=0, 最多加载张数=0, 载入设备="仅CPU",
+                生成预览拼贴=True, 预览列数=4, 预览单格大小=64, 自定义路径=tmp,
+            )
+            images, preview = out[0], out[1]
+            assert len(images) == 70, f"应加载 70 张，实际 {len(images)}"
+
+            cols, cell, gap = 4, 64, 6
+            rows = (70 + cols - 1) // cols
+            exp_w = cols * cell + (cols + 1) * gap
+            exp_h = rows * cell + (rows + 1) * gap
+            assert preview.shape[1] == exp_h and preview.shape[2] == exp_w, \
+                f"预览未包含全部 70 张：{tuple(preview.shape)}，期望 ({exp_h}, {exp_w})"
+
+            # 显式限制预览张数时应生效
+            out2 = node.load_batch(
+                加载来源="input/_zxin_test", 文件名匹配="*.png", 排序方式="按名称升序",
+                随机种子=0, 最多加载张数=0, 载入设备="仅CPU",
+                生成预览拼贴=True, 预览列数=4, 预览单格大小=64, 自定义路径=tmp,
+                预览最多显示张数=10,
+            )
+            rows2 = (10 + cols - 1) // cols
+            exp_h2 = rows2 * cell + (rows2 + 1) * gap
+            assert out2[1].shape[1] == exp_h2, \
+                f"预览上限未生效：{tuple(out2[1].shape)}，期望高 {exp_h2}"
+            assert len(out2[0]) == 70, "限制预览张数不应影响实际加载数量"
+            print("    预览张数跟随实际加载量（70 张全出），预览上限可独立限制")
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    check("预览拼贴无隐藏张数上限", test_preview_no_hidden_limit)
+
+    def test_progress_push():
+        """加载时应实时推送「加载数量 / 加载进度」给前端。"""
+        import ComfyUI_ZXin.nodes as N
+        pushed = []
+        orig = N._progress_push
+        try:
+            N._progress_push = lambda node_id, count, progress, total=0: \
+                pushed.append((node_id, count, progress, total))
+            node = mapping["ZXIN_BatchImageLoader"]()
+            out = node.load_batch(
+                加载来源="input/_zxin_test", 文件名匹配="*.png", 排序方式="按名称升序",
+                随机种子=0, 最多加载张数=0, 载入设备="仅CPU",
+                生成预览拼贴=False, 预览列数=4, 预览单格大小=128, 自定义路径="",
+                unique_id="test-uid-1",
+            )
+        finally:
+            N._progress_push = orig
+
+        assert pushed, "加载过程未推送进度事件"
+        node_id, count, progress, total = pushed[-1]
+        assert node_id == "test-uid-1", f"推送的节点 id 不对: {node_id}"
+        assert count == len(out[0]), f"推送数量与实际加载量不符: {count} vs {len(out[0])}"
+        assert isinstance(progress, str) and progress, "推送的进度文案为空"
+        # 输出端口仍须保留数量与进度
+        assert out[3] == count, "「加载数量」输出与推送值不一致"
+        assert out[4] == progress, "「加载进度」输出与推送值不一致"
+        print(f"    已推送数量 {count} / 总数 {total}，输出端口保留")
+
+    check("加载进度实时推送", test_progress_push)
+
     def test_saver():
         node = mapping["ZXIN_BatchImageSaver"]()
         imgs = [torch.rand(1, 48, 48, 3) for _ in range(3)]

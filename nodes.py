@@ -183,6 +183,25 @@ def _lazy_get(key):
     return st
 
 
+def _progress_push(node_id, count, progress, total=0):
+    """把「加载数量 / 加载进度」实时推给前端，在节点上直接显示。
+
+    与 _lazy_push 分开：这条只负责显示，失败不影响主流程，
+    所以异常一律静默吞掉，绝不因前端不可用而中断加载。
+    """
+    try:
+        from server import PromptServer
+
+        PromptServer.instance.send_sync("zxin.loader_progress", {
+            "node": str(node_id or ""),
+            "count": int(count or 0),
+            "total": int(total or 0),
+            "progress": str(progress or ""),
+        })
+    except Exception:
+        pass
+
+
 # =====================================================================
 # 1. 批量图像加载器（含文件夹图片预览）
 # =====================================================================
@@ -228,6 +247,13 @@ class ZXIN_BatchImageLoader:
                     "default": 0, "min": 0, "max": 262144, "step": 256,
                     "tooltip": "单位 MB。0 = 自动取当前可用内存的一半作为单批预算；"
                                "大于 0 时按该值切分每批张数。仅在分批生效时使用。",
+                }),
+                # ↓ 预览张数上限（追加在末尾，破坏性最小位置）
+                "预览最多显示张数": ("INT", {
+                    "default": 0, "min": 0, "max": 4096, "step": 1,
+                    "tooltip": "文件夹预览拼贴最多显示多少张。0 = 与实际加载张数一致。"
+                               "拼贴是单张超长图，张数过多会占用大量显存，"
+                               "此时可在此限制预览张数以控制开销（不影响实际加载数量）。",
                 }),
             },
             "optional": {
@@ -319,7 +345,7 @@ class ZXIN_BatchImageLoader:
     def IS_CHANGED(cls, 加载来源, 文件名匹配, 排序方式, 随机种子, 最多加载张数,
                    载入设备, 生成预览拼贴, 预览列数, 预览单格大小, 自定义路径="",
                    含子文件夹=False, 限制最大边长=0, 加载模式=_LAZY_AUTO,
-                   单批内存上限=0, **kwargs):
+                   单批内存上限=0, 预览最多显示张数=0, **kwargs):
         # 目录内容可能在不改变控件的情况下发生变化，所以对文件列表取指纹
         try:
             root = resolve_root(加载来源, 自定义路径)
@@ -352,7 +378,7 @@ class ZXIN_BatchImageLoader:
     def load_batch(self, 加载来源, 文件名匹配, 排序方式, 随机种子, 最多加载张数,
                    载入设备, 生成预览拼贴, 预览列数, 预览单格大小, 自定义路径="",
                    含子文件夹=False, 限制最大边长=0, 加载模式=_LAZY_AUTO,
-                   单批内存上限=0, unique_id=None):
+                   单批内存上限=0, 预览最多显示张数=0, unique_id=None):
         """加载一批图片。惰性模式下只解码 [cursor, cursor+块大小) 这一段。"""
         root = resolve_root(加载来源, 自定义路径)
         if not root or not os.path.isdir(root):
@@ -389,7 +415,15 @@ class ZXIN_BatchImageLoader:
 
         # 保留每张图的原始尺寸，各自独立成张量
         # 预览需要前若干张缩略图，顺带在解码时一并生成，避免二次解码
-        thumb_limit = 64 if 生成预览拼贴 else 0
+        # 预取数量与拼贴上限一致：少了会导致拼贴时重新解码（等于白做惰性），
+        # 多了则白白占用内存
+        if 生成预览拼贴:
+            if 预览最多显示张数 and 预览最多显示张数 > 0:
+                thumb_limit = min(end - start, int(预览最多显示张数))
+            else:
+                thumb_limit = end - start
+        else:
+            thumb_limit = 0
         images, names, skipped, thumbs = load_images_varlist(
             paths, dev, dt, max_side=限制最大边长,
             thumb_limit=thumb_limit, thumb_size=预览单格大小,
@@ -448,12 +482,25 @@ class ZXIN_BatchImageLoader:
         # 为没有预载缩略图的图片重新解码，那就等于把整批都解了，白做惰性
         preview = torch.zeros((1, 64, 64, 3), dtype=dt, device=dev)
         if 生成预览拼贴:
+            # 预览张数上限 = min(本批实际张数, 用户设定值)
+            # 不能写死上限，否则会出现「设了加载 100 张、预览只有 64 张」
+            batch_count = len(paths[start:end])
+            if 预览最多显示张数 and 预览最多显示张数 > 0:
+                sheet_limit = min(batch_count, int(预览最多显示张数))
+            else:
+                sheet_limit = batch_count
             sheet, _layout = make_contact_sheet(
-                paths[start:end], cols=预览列数, cell=预览单格大小, label=True, preloaded=thumbs
+                paths[start:end], cols=预览列数, cell=预览单格大小, label=True,
+                max_items=sheet_limit, preloaded=thumbs
             )
             if sheet is not None:
                 preview = pil_to_tensor(sheet, dev, dt)
 
+        # 实时把数量与进度推到前端，直接显示在节点上
+        _progress_push(key, len(images), progress, total=total)
+
+        # 保持元组返回：OUTPUT_IS_LIST 的多轮调度依赖这个形状，
+        # 改成 {"ui":..., "result":...} 会破坏下游与既有调用方
         return (images, preview, safe_json(names), len(images), progress)
 
 
