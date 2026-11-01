@@ -305,13 +305,24 @@ def resize_to(img, w, h, mode="stretch"):
 
 
 def pil_to_tensor(img, device, dtype):
-    """RGB PIL → ComfyUI IMAGE 张量 [1, H, W, 3]，取值 0~1。"""
-    arr = np.array(img.convert("RGB")).astype(np.float32) / 255.0
-    return torch.from_numpy(arr)[None].to(device=device, dtype=dtype)
+    """RGB PIL → ComfyUI IMAGE 张量 [1, H, W, 3]，取值 0~1。
+
+    原地做除法，避免 `astype(...)/255.0` 额外产生一份 float32 中间数组
+    （大图下每张可省约 1/3 的峰值内存）。
+    """
+    rgb = img.convert("RGB")
+    arr = np.array(rgb, dtype=np.uint8, copy=True)
+    out = np.empty(arr.shape, dtype=np.float32)
+    np.multiply(arr, np.float32(1.0 / 255.0), out=out, casting="unsafe")
+    t = torch.from_numpy(out)[None]
+    if t.dtype != dtype or t.device != torch.device(device):
+        t = t.to(device=device, dtype=dtype)
+    return t
 
 
 def load_images_varlist(paths, device, dtype, max_side=0,
-                        thumb_limit=0, thumb_size=192):
+                        thumb_limit=0, thumb_size=192,
+                        start=0, count=0):
     """按原始尺寸加载多张图片，返回 IMAGE 张量列表。
 
     每张图独立成张量 [1,H,W,C]，**尺寸互不相同也不需要相同**。
@@ -324,8 +335,17 @@ def load_images_varlist(paths, device, dtype, max_side=0,
     thumb_limit > 0 时额外返回前 thumb_limit 张的缩略图（PIL，长边不超过
     thumb_size），供预览拼贴复用，避免同一批图片被解码两次。
 
+    start / count 用于**惰性分批**：只解码 [start, start+count) 这一段
+    （count<=0 表示一直取到末尾）。这是控制峰值内存的唯一有效手段 ——
+    ComfyUI 的 IMAGE 端口只收张量，返回 N 张就必然同时驻留 N 张。
+
     返回 (张量列表, 文件名列表, 跳过列表, 缩略图列表[(路径, PIL)])。
     """
+    total = len(paths)
+    start = max(0, min(int(start), total))
+    end = total if not count or count <= 0 else min(total, start + int(count))
+    paths = paths[start:end]
+
     out, names, skipped, thumbs = [], [], [], []
     for p in paths:
         img = load_pil(p)
@@ -530,6 +550,74 @@ def estimate_memory_mb(shapes):
     """
     pixels = sum(int(w) * int(h) for w, h in shapes if w and h)
     return pixels * 3 * 4 / (1024.0 * 1024.0)
+
+
+# ---------------------------------------------------------------- 内存探测
+
+def available_memory_mb():
+    """探测当前可用物理内存（MB）。零额外依赖，失败返回 0。
+
+    Windows 走 GlobalMemoryStatusEx，Linux 读 /proc/meminfo，
+    macOS 用 sysctl；都拿不到就返回 0，调用方需自行兜底。
+    """
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MemStatus(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            st = _MemStatus()
+            st.dwLength = ctypes.sizeof(_MemStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return float(st.ullAvailPhys) / (1024.0 * 1024.0)
+            return 0.0
+
+        if os.path.exists("/proc/meminfo"):
+            with open("/proc/meminfo", "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return float(line.split()[1]) / 1024.0
+            return 0.0
+
+        out = os.popen("sysctl -n hw.memsize 2>/dev/null").read().strip()
+        if out.isdigit():
+            # macOS 没有直接的可用量，用总量的一半做个保守估计
+            return float(out) / (1024.0 * 1024.0) * 0.5
+    except Exception:
+        pass
+    return 0.0
+
+
+def plan_chunk(paths, budget_mb, probe_limit=24):
+    """按内存预算规划「一次解码多少张」，返回 (块大小, 预估总MB, 单张平均MB)。
+
+    budget_mb <= 0 时表示不限制，返回 (len(paths), 总MB, 平均MB)。
+    抽样式预估：只 probe 前 probe_limit 张的尺寸，避免为算预算而扫全目录。
+    """
+    sample = [s for s in (probe_size(p) for p in paths[:probe_limit]) if s]
+    if not sample:
+        return len(paths), 0.0, 0.0
+
+    avg_mb = estimate_memory_mb([(w, h) for w, h in sample]) / float(len(sample))
+    total_mb = avg_mb * len(paths)
+
+    if budget_mb and budget_mb > 0 and avg_mb > 0:
+        chunk = int(budget_mb / avg_mb)
+        # 至少解码 1 张，否则永远推不动
+        return max(1, min(len(paths), chunk)), total_mb, avg_mb
+
+    return len(paths), total_mb, avg_mb
 
 
 def parse_json_list(text):

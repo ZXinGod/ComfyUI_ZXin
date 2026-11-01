@@ -240,11 +240,12 @@ def main():
             载入设备="仅CPU",
             生成预览拼贴=False, 预览列数=4, 预览单格大小=128, 自定义路径="",
         )
-        images, preview, names, count = out
+        images, preview, names, count, progress = out
         assert isinstance(images, list), f"图片列表必须是 list: {type(images)}"
         assert len(images) == count == 20, f"数量错误: {len(images)} vs {count}"
         assert preview.ndim == 4, f"预览图维度错误: {preview.shape}"
         assert "test_00.png" in names, f"文件名列表异常: {names}"
+        assert isinstance(progress, str) and progress, "加载进度必须有内容"
         # 每张图独立，尺寸可以不同
         for t in images:
             assert t.ndim == 4 and t.shape[0] == 1, f"单图形状错误: {t.shape}"
@@ -295,6 +296,120 @@ def main():
         print(f"    最多加载张数=3 实际取到 {len(out[0])} 张")
 
     check("批量加载器 (最多加载张数截断)", test_loader_max_images)
+
+    def _lazy_base(**override):
+        """构造惰性分批测试的公共参数。"""
+        base = dict(
+            加载来源="input/_zxin_test", 文件名匹配="*.png",
+            排序方式="按名称升序", 随机种子=0, 最多加载张数=0,
+            载入设备="仅CPU", 生成预览拼贴=False,
+            预览列数=4, 预览单格大小=128, 自定义路径="",
+        )
+        base.update(override)
+        return base
+
+    def test_lazy_plan_modes():
+        """三种加载模式的判定必须稳定，且执行函数与 IS_CHANGED 用同一套判定。"""
+        from ComfyUI_ZXin.common import plan_chunk, sort_files, cached_list_images, resolve_root
+        import ComfyUI_ZXin.nodes as N
+
+        paths = sort_files(
+            cached_list_images(resolve_root("input/_zxin_test", ""), "*.png", False),
+            "name_asc", 0)
+        assert len(paths) == 20, f"测试目录应有 20 张，实际 {len(paths)}"
+
+        # 全部载入：不惰性，块大小 = 总数
+        lazy, chunk, _t, _b = N.ZXIN_BatchImageLoader._lazy_plan(paths, N._LAZY_OFF, 0)
+        assert lazy is False and chunk == 20, f"全部载入判定错误: lazy={lazy} chunk={chunk}"
+
+        # 惰性分批：必定惰性，块大小受预算约束
+        lazy, chunk, _t, budget = N.ZXIN_BatchImageLoader._lazy_plan(paths, N._LAZY_ON, 1)
+        assert lazy is True, "「惰性分批」应始终启用惰性"
+        expect_chunk, _tm, _am = plan_chunk(paths, 1)
+        assert chunk == max(1, min(20, expect_chunk)), f"块大小不符: {chunk} vs {expect_chunk}"
+        assert 1 <= chunk < 20, f"1MB 预算应把 20 张切成多批，实际 {chunk}"
+
+        # 自动模式：小目录（几 MB）远低于可用资源的一半，不应触发
+        lazy, chunk, total_mb, budget = N.ZXIN_BatchImageLoader._lazy_plan(paths, N._LAZY_AUTO, 0)
+        from ComfyUI_ZXin.common import available_memory_mb
+        avail = available_memory_mb()
+        if avail > 0:
+            assert lazy == (total_mb > avail * N._LAZY_TRIGGER_RATIO), "自动模式阈值判定不一致"
+            # 预算应比触发阈值更保守，给模型权重留余量
+            assert budget <= avail * N._LAZY_TRIGGER_RATIO + 1e-6, \
+                f"单批预算 {budget:.0f} MB 不应超过触发阈值 {avail * N._LAZY_TRIGGER_RATIO:.0f} MB"
+        assert chunk == (chunk if lazy else 20)
+        print(f"    自动模式：预估 {total_mb:.0f} MB / 可用 {avail:.0f} MB → 惰性={lazy}，"
+              f"单批预算 {budget:.0f} MB")
+
+    check("惰性加载 (三种模式判定)", test_lazy_plan_modes)
+
+    def test_lazy_chunks_cover_all():
+        """核心：多轮推进必须覆盖全部图片，不重复、不遗漏、顺序一致。"""
+        import ComfyUI_ZXin.nodes as N
+
+        uid = "test_lazy_chunks"
+        N._LAZY_STATE.pop(uid, None)
+        node = N.ZXIN_BatchImageLoader()
+        kw = _lazy_base(加载模式=N._LAZY_ON, 单批内存上限=1)
+
+        from ComfyUI_ZXin.common import plan_chunk, sort_files, cached_list_images, resolve_root
+        paths = sort_files(
+            cached_list_images(resolve_root("input/_zxin_test", ""), "*.png", False),
+            "name_asc", 0)
+        chunk, _t, _a = plan_chunk(paths, 1)
+        chunk = max(1, min(len(paths), chunk))
+
+        seen, rounds, last = [], 0, ""
+        for _ in range(500):
+            # 真实引擎会先问 IS_CHANGED；分批模式下它必须随游标变化
+            N.ZXIN_BatchImageLoader.IS_CHANGED(**kw, unique_id=uid)
+            imgs, preview, names_json, count, progress = node.load_batch(**kw, unique_id=uid)
+            assert len(imgs) <= chunk, f"单批 {len(imgs)} 张超过块大小 {chunk}"
+            assert len(imgs) == count, f"count 与本批张数不符: {count} vs {len(imgs)}"
+            seen.extend(json.loads(names_json))
+            last = progress
+            rounds += 1
+            if N._LAZY_STATE[uid]["finished"]:
+                break
+
+        expected = [os.path.basename(p) for p in paths]
+        assert seen == expected, (
+            f"分批推进结果不等于全量顺序：\n  得到 {seen}\n  期望 {expected}")
+        assert rounds > 1, f"应当分多轮执行，实际只跑了 {rounds} 轮"
+        assert "全部完成" in last, f"末轮进度应提示完成，实际: {last}"
+        assert rounds == (20 + chunk - 1) // chunk, f"轮次不符: {rounds}"
+        print(f"    分 {rounds} 轮跑完 20 张（每批 ≤{chunk}），顺序与全量一致，无重漏")
+
+    check("惰性加载 (多轮推进不重不漏)", test_lazy_chunks_cover_all)
+
+    def test_lazy_reset_after_finish():
+        """跑完全部批次后再次执行，应从第 1 张重新开始而不是卡在末尾。"""
+        import ComfyUI_ZXin.nodes as N
+
+        uid = "test_lazy_reset"
+        N._LAZY_STATE.pop(uid, None)
+        node = N.ZXIN_BatchImageLoader()
+        kw = _lazy_base(加载模式=N._LAZY_ON, 单批内存上限=1)
+
+        # 跑到 finished
+        for _ in range(500):
+            node.load_batch(**kw, unique_id=uid)
+            if N._LAZY_STATE[uid]["finished"]:
+                break
+        assert N._LAZY_STATE[uid]["finished"], "未能跑到完成状态"
+
+        # IS_CHANGED 发现 finished 会清掉状态，下一次从头开始
+        changed = N.ZXIN_BatchImageLoader.IS_CHANGED(**kw, unique_id=uid)
+        assert isinstance(changed, str) and changed.endswith("#reset"), \
+            f"跑完后 IS_CHANGED 应返回 reset 标记，实际 {changed}"
+        imgs, _p, names_json, _c, _prog = node.load_batch(**kw, unique_id=uid)
+        first = json.loads(names_json)[0]
+        assert first == "test_00.png", f"重置后应从第一张开始，实际 {first}"
+        assert N._LAZY_STATE[uid]["cursor"] == len(imgs) > 0, "重置后游标应重新推进"
+        print(f"    跑完后再次执行从第 1 张重新开始（{first}）")
+
+    check("惰性加载 (跑完自动重置)", test_lazy_reset_after_finish)
 
     def test_loader_subfolder_choice():
         """加载来源下拉应能列出 input 的一级子文件夹。"""
@@ -598,7 +713,7 @@ def main():
         assert split.OUTPUT_IS_LIST == tuple([True] * 12 + [False]), \
             f"并行分发器 OUTPUT_IS_LIST 配置错误: {split.OUTPUT_IS_LIST}"
         loader = mapping["ZXIN_BatchImageLoader"]
-        assert loader.OUTPUT_IS_LIST == (True, False, False, False), \
+        assert loader.OUTPUT_IS_LIST == (True, False, False, False, False), \
             f"加载器 OUTPUT_IS_LIST 配置错误: {loader.OUTPUT_IS_LIST}"
         print("    列表标记仅作用于图像输出")
 

@@ -3,7 +3,7 @@
 用法：
     python tools/package.py [输出目录]
 
-默认输出到工作区根目录，文件名形如 ComfyUI_ZXin-v1.1.0.zip
+默认输出到工作区根目录，文件名形如 ComfyUI_ZXin-v1.2.0.zip
 """
 
 import os

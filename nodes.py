@@ -30,6 +30,7 @@ import torch
 from PIL import Image, PngImagePlugin
 
 from .common import (
+    available_memory_mb,
     cached_list_images,
     device_dtype,
     draw_label,
@@ -40,6 +41,7 @@ from .common import (
     make_contact_sheet,
     parse_json_list,
     pil_to_tensor,
+    plan_chunk,
     probe_size,
     resolve_root,
     resize_to,
@@ -130,6 +132,58 @@ def supports_result_ui():
 
 
 # =====================================================================
+# 惰性分批加载：服务端游标 + 前端自动排队
+# =====================================================================
+# ComfyUI 的 IMAGE 端口只收 float32 张量，加载器返回 N 张就必然同时驻留
+# N 张，「延迟到用时再解码」在架构上做不到。唯一有效的省内存手段是
+# **一次只解码一小批**，剩下的靠多次执行推进。
+#
+# 推进方式：加载器内部维护游标，每执行完一批就通过 WebSocket 发
+# zxin.lazy_continue 事件，前端收到后自动再排一次队，直到全部跑完。
+# 游标以节点 ID（UNIQUE_ID）为键，多个加载器节点互不干扰。
+
+_LAZY_AUTO = "自动（超内存阈值才惰性）"
+_LAZY_OFF = "全部载入（不惰性）"
+_LAZY_ON = "惰性分批"
+
+_LAZY_STATE = {}
+_LAZY_STATE_MAX = 32
+_LAZY_PUSH_WARNED = {"done": False}
+
+# 预估总量超过可用资源的这个比例 → 启用惰性分批
+_LAZY_TRIGGER_RATIO = 0.5
+# 单批预算占可用资源的比例。比触发阈值更保守：
+# ComfyUI 本身还要常驻模型权重，不能让加载器把空闲资源吃干
+_LAZY_BUDGET_RATIO = 0.25
+
+
+def _lazy_push(node_id, payload):
+    """通知前端「还有下一批」，驱动自动排队。失败时降级为手动重复运行。
+
+    只在第一次失败时打印提示 —— 每批都刷一条警告会淹没有用的进度信息。
+    """
+    try:
+        from server import PromptServer
+
+        PromptServer.instance.send_sync("zxin.lazy_continue", payload)
+        return True
+    except Exception as e:
+        if not _LAZY_PUSH_WARNED["done"]:
+            _LAZY_PUSH_WARNED["done"] = True
+            print(f"[ZXIN 批量图像加载器] 自动续跑通知不可用，将改为手动重复运行：{e}")
+        return False
+
+
+def _lazy_get(key):
+    st = _LAZY_STATE.get(key)
+    if st is None and len(_LAZY_STATE) >= _LAZY_STATE_MAX:
+        # 简单淘汰：丢掉最早插入的键，防止长期运行后无限增长
+        for k in list(_LAZY_STATE)[:_LAZY_STATE_MAX // 2]:
+            _LAZY_STATE.pop(k, None)
+    return st
+
+
+# =====================================================================
 # 1. 批量图像加载器（含文件夹图片预览）
 # =====================================================================
 class ZXIN_BatchImageLoader:
@@ -164,21 +218,37 @@ class ZXIN_BatchImageLoader:
                     "tooltip": "0 = 完全保留原始尺寸；大于 0 时把长边等比缩放到不超过该值，"
                                "用于避免超大目录一次性载入撑爆内存。",
                 }),
+                # ↓ 惰性分批控件（v1.2 新增，仍追加在末尾）
+                "加载模式": ([_LAZY_AUTO, _LAZY_OFF, _LAZY_ON],
+                             {"default": _LAZY_AUTO,
+                              "tooltip": "「自动」= 预估内存超过可用内存一半时才分批；"
+                                         "「惰性分批」= 无论大小都分批；"
+                                         "「全部载入」= 一次性载入（旧行为）。"}),
+                "单批内存上限": ("INT", {
+                    "default": 0, "min": 0, "max": 262144, "step": 256,
+                    "tooltip": "单位 MB。0 = 自动取当前可用内存的一半作为单批预算；"
+                               "大于 0 时按该值切分每批张数。仅在分批生效时使用。",
+                }),
             },
             "optional": {
                 "自定义路径": ("STRING", {"default": "", "multiline": False}),
             },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING", "INT")
-    RETURN_NAMES = ("图片列表", "文件夹预览图", "文件名列表", "加载数量")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING", "INT", "STRING")
+    RETURN_NAMES = ("图片列表", "文件夹预览图", "文件名列表", "加载数量", "加载进度")
     FUNCTION = "load_batch"
     CATEGORY = CATEGORY
-    OUTPUT_IS_LIST = (True, False, False, False)
+    OUTPUT_IS_LIST = (True, False, False, False, False)
     DESCRIPTION = (
         "从 input/output 目录或自定义路径批量加载图像，**保留每张图的原始尺寸**，"
         "以列表输出。「文件夹预览图」会显示这个文件夹里的图片拼贴，方便确认内容。"
         "可勾选「含子文件夹」递归扫描，也可用「限制最大边长」控制内存开销。"
+        "目录过大时（预估内存超过可用内存一半）自动切换为**惰性分批**："
+        "每次只解码一小批，跑完自动续排下一批，直到全部处理完。"
     )
     SEARCH_ALIASES = ["batch load image", "load images batch", "批量加载图片", "批量图像加载", "文件夹预览"]
 
@@ -206,22 +276,84 @@ class ZXIN_BatchImageLoader:
                 return f"目录不存在或不可访问：{root or '(空)'}"
         return True
 
+    @staticmethod
+    def _lazy_avail_mb(device=None):
+        """估算可用于图像张量的资源（MB）。
+
+        张量放在 CUDA 上时必须按**显存**算 —— 拿系统内存当预算会严重高估，
+        直接导致显存 OOM。取不到就退回系统内存探测。
+        """
+        if device is not None and getattr(device, "type", "") == "cuda":
+            try:
+                free, _total = torch.cuda.mem_get_info(device)
+                return float(free) / (1024.0 * 1024.0)
+            except Exception:
+                pass
+        return available_memory_mb()
+
+    @classmethod
+    def _lazy_plan(cls, paths, 加载模式, 单批内存上限=0, device=None):
+        """决定是否走惰性分批，返回 (惰性开关, 块大小, 预估总MB, 预算MB)。"""
+        total = len(paths)
+
+        if 加载模式 == _LAZY_OFF:
+            return False, total, 0.0, 0.0
+
+        avail = cls._lazy_avail_mb(device)
+        # 预算：用户指定优先；否则取可用资源的 _LAZY_BUDGET_RATIO
+        budget = float(单批内存上限) if 单批内存上限 and 单批内存上限 > 0 \
+            else avail * _LAZY_BUDGET_RATIO
+        budget = max(0.0, budget)
+
+        chunk, total_mb, _avg = plan_chunk(paths, budget)
+        chunk = max(1, min(total, chunk))   # 至少 1 张，否则永远推不动
+
+        if 加载模式 == _LAZY_ON:
+            return True, chunk, total_mb, budget
+
+        # 自动：预估总量超过可用资源的一半才分批
+        lazy = avail > 0 and total_mb > avail * _LAZY_TRIGGER_RATIO
+        return lazy, (chunk if lazy else total), total_mb, budget
+
     @classmethod
     def IS_CHANGED(cls, 加载来源, 文件名匹配, 排序方式, 随机种子, 最多加载张数,
                    载入设备, 生成预览拼贴, 预览列数, 预览单格大小, 自定义路径="",
-                   含子文件夹=False, 限制最大边长=0):
+                   含子文件夹=False, 限制最大边长=0, 加载模式=_LAZY_AUTO,
+                   单批内存上限=0, **kwargs):
         # 目录内容可能在不改变控件的情况下发生变化，所以对文件列表取指纹
         try:
             root = resolve_root(加载来源, 自定义路径)
             paths = sort_files(cached_list_images(root, 文件名匹配, 含子文件夹),
                                cls._SORT_MAP.get(排序方式, "name_asc"), 随机种子)
-            return files_signature(paths[:最多加载张数] if 最多加载张数 else paths)
+            if 最多加载张数 and 最多加载张数 > 0:
+                paths = paths[:最多加载张数]
+            sig = files_signature(paths)
+
+            # 与执行函数用同一套判定（含设备），否则可能出现
+            # 「IS_CHANGED 认为不用分批、执行时却分批」的错位
+            dev, _dt = device_dtype()
+            if 载入设备 == "仅CPU":
+                dev = torch.device("cpu")
+            lazy, _chunk, _total_mb, _budget = cls._lazy_plan(paths, 加载模式, 单批内存上限, dev)
+            if not lazy:
+                return sig
+
+            # 分批模式下把游标并入指纹：每推进一批返回值就变，强制重新执行
+            key = str(kwargs.get("unique_id") or "global")
+            st = _lazy_get(key)
+            if st and st.get("finished"):
+                # 上一轮已跑完，用户再次点击时从头开始
+                _LAZY_STATE.pop(key, None)
+                return sig + "#reset"
+            return "%s#%d" % (sig, int((st or {}).get("cursor", 0)))
         except Exception:
             return float("NaN")
 
     def load_batch(self, 加载来源, 文件名匹配, 排序方式, 随机种子, 最多加载张数,
                    载入设备, 生成预览拼贴, 预览列数, 预览单格大小, 自定义路径="",
-                   含子文件夹=False, 限制最大边长=0):
+                   含子文件夹=False, 限制最大边长=0, 加载模式=_LAZY_AUTO,
+                   单批内存上限=0, unique_id=None):
+        """加载一批图片。惰性模式下只解码 [cursor, cursor+块大小) 这一段。"""
         root = resolve_root(加载来源, 自定义路径)
         if not root or not os.path.isdir(root):
             raise ValueError(f"目录不存在或不可访问：{root or '(空)'}")
@@ -237,18 +369,23 @@ class ZXIN_BatchImageLoader:
         if 载入设备 == "仅CPU":
             dev = torch.device("cpu")
 
-        # 加载前抽样估算内存开销，超大目录给出明确提示
-        sample = paths[:32]
-        sample_sizes = [s for s in (probe_size(p) for p in sample) if s]
-        if sample_sizes:
-            avg_px = sum(w * h for w, h in sample_sizes) / float(len(sample_sizes))
-            est_mb = avg_px * len(paths) * 3 * 4 / (1024.0 * 1024.0)
-            if est_mb >= 1024.0:
-                print(
-                    f"[ZXIN 批量图像加载器] 即将加载 {len(paths)} 张，预估内存约 "
-                    f"{est_mb / 1024.0:.1f} GB。若内存不足，请把「最多加载张数」调小 "
-                    f"或设置「限制最大边长」。"
-                )
+        # ---- 惰性分批：决定本次解码哪一段 ----
+        total = len(paths)
+        lazy, chunk, total_mb, budget = self._lazy_plan(paths, 加载模式, 单批内存上限, dev)
+
+        key = str(unique_id or "global")
+        sig = files_signature(paths)
+        st = _lazy_get(key)
+        if not st or st.get("sig") != sig or st.get("finished"):
+            st = {"sig": sig, "cursor": 0, "total": total, "finished": False}
+
+        if lazy:
+            start = max(0, min(int(st.get("cursor", 0)), total))
+            end = min(total, start + max(1, int(chunk)))
+        else:
+            start, end = 0, total
+        if start >= end:  # 兜底：游标越界就从头开始
+            start, end = 0, min(total, max(1, end - start or chunk or total))
 
         # 保留每张图的原始尺寸，各自独立成张量
         # 预览需要前若干张缩略图，顺带在解码时一并生成，避免二次解码
@@ -256,6 +393,7 @@ class ZXIN_BatchImageLoader:
         images, names, skipped, thumbs = load_images_varlist(
             paths, dev, dt, max_side=限制最大边长,
             thumb_limit=thumb_limit, thumb_size=预览单格大小,
+            start=start, count=(end - start),
         )
 
         if not images:
@@ -265,21 +403,58 @@ class ZXIN_BatchImageLoader:
 
         actual_mb = estimate_memory_mb([(t.shape[2], t.shape[1]) for t in images])
         shapes = {tuple(t.shape[1:3]) for t in images}
-        print(
-            f"[ZXIN 批量图像加载器] 已加载 {len(images)} 张（{len(shapes)} 种尺寸），"
-            f"设备 {dev}，占用约 {actual_mb:.0f} MB"
-        )
+
+        # ---- 推进游标，必要时通知前端续跑 ----
+        st["cursor"] = end
+        st["total"] = total
+        st["finished"] = end >= total
+        _LAZY_STATE[key] = st
+
+        if lazy:
+            batch_total = max(1, (total + max(1, chunk) - 1) // max(1, chunk))
+            batch_no = min(batch_total, (start // max(1, chunk)) + 1)
+            print(
+                f"[ZXIN 批量图像加载器] 惰性分批：第 {batch_no}/{batch_total} 批，"
+                f"本批 {len(images)} 张（{len(shapes)} 种尺寸），进度 {end}/{total}，"
+                f"本批约 {actual_mb:.0f} MB / 预算 {budget:.0f} MB（总量预估 {total_mb:.0f} MB）"
+            )
+            if not st["finished"]:
+                _lazy_push(key, {
+                    "node": key,
+                    "done": end,
+                    "total": total,
+                    "remaining": total - end,
+                    "batch": batch_no,
+                    "batch_total": batch_total,
+                })
+                progress = (
+                    f"惰性分批：已加载 {end}/{total} 张（第 {batch_no}/{batch_total} 批，"
+                    f"每批 {chunk} 张）。剩余 {total - end} 张将自动续跑。"
+                )
+            else:
+                progress = (
+                    f"惰性分批：已加载 {end}/{total} 张（第 {batch_no}/{batch_total} 批），"
+                    f"全部完成。再次点击运行将从头开始。"
+                )
+        else:
+            print(
+                f"[ZXIN 批量图像加载器] 已加载 {len(images)} 张（{len(shapes)} 种尺寸），"
+                f"设备 {dev}，占用约 {actual_mb:.0f} MB"
+            )
+            progress = f"全部载入：{len(images)} 张一次载入完成，占用约 {actual_mb:.0f} MB"
 
         # 文件夹缩略图拼贴（预览用）
+        # 惰性模式下只对【本批】生成：传全部 paths 会让 make_contact_sheet
+        # 为没有预载缩略图的图片重新解码，那就等于把整批都解了，白做惰性
         preview = torch.zeros((1, 64, 64, 3), dtype=dt, device=dev)
         if 生成预览拼贴:
             sheet, _layout = make_contact_sheet(
-                paths, cols=预览列数, cell=预览单格大小, label=True, preloaded=thumbs
+                paths[start:end], cols=预览列数, cell=预览单格大小, label=True, preloaded=thumbs
             )
             if sheet is not None:
                 preview = pil_to_tensor(sheet, dev, dt)
 
-        return (images, preview, safe_json(names), len(names))
+        return (images, preview, safe_json(names), len(images), progress)
 
 
 # =====================================================================
