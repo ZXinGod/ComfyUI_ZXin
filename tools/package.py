@@ -17,6 +17,8 @@ PKG_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 不进压缩包的内容
 EXCLUDE_NAMES = {"__pycache__", ".git", ".idea", ".vscode", "node_modules"}
 EXCLUDE_SUFFIX = (".pyc", ".pyo", ".pyd", ".log", ".tmp", ".swp")
+# 仅供开发者在本机发布用，用户安装不需要
+EXCLUDE_FILES = {"tools/publish.py"}
 
 # 必须存在的文件（缺任何一个都判定为打包失败）
 # 统一用正斜杠，与 collect() 产出的包内相对路径格式一致
@@ -54,8 +56,10 @@ def collect():
             if name in EXCLUDE_NAMES:
                 continue
             full = os.path.join(root, name)
-            rel = os.path.relpath(full, PKG_ROOT)
-            items.append((full, rel.replace(os.sep, "/")))
+            rel = os.path.relpath(full, PKG_ROOT).replace(os.sep, "/")
+            if rel in EXCLUDE_FILES:
+                continue
+            items.append((full, rel))
     return items
 
 

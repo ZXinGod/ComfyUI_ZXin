@@ -358,6 +358,27 @@ python_embeded/python.exe custom_nodes/ComfyUI_ZXin/tests/test_nodes.py
 
 ---
 
+## 发布到 GitHub（维护者）
+
+仓库内置了一键发布脚本，整条链路一次跑完：
+
+```bash
+# 先看计划（不改任何东西）
+python tools/publish.py --dry-run --version 1.4.0 -m "feat: xxx"
+
+# 真发布：检查 → 同步 → 版本号 → 测试 → 打包 → 提交 → tag → push → Release → 附件 → 验证
+python tools/publish.py --version 1.4.0 -m "feat: xxx"
+```
+
+脚本已内建处理：代理自动探测、GitHub 凭据非交互读取、
+`uploads.github.com` / `api.github.com` 端点区分、同名附件替换、网络失败重试。
+完整参数表与手动应急流程见 [`tools/PUBLISH.md`](tools/PUBLISH.md)。
+
+> **发布前必查**：README 顶部「当前版本」、CHANGELOG 顶部条目、
+> README「升级说明」节的新增控件清单。
+
+---
+
 ## 发布到 Comfy Registry
 
 `pyproject.toml` 已按官方规范写好，`Repository` 与 `PublisherId` 已填为 `ZXinGod`。
@@ -395,7 +416,9 @@ ComfyUI_ZXin/
 │   └── ZXin_03_四路并行分发.json
 ├── tools/
 │   ├── make_example_workflows.py   # 示例工作流生成脚本
-│   └── package.py                  # 打包脚本（生成 Release 用 zip）
+│   ├── package.py                  # 打包脚本（生成 Release 用 zip）
+│   ├── publish.py                  # 一键发布（提交→tag→push→Release→附件）
+│   └── PUBLISH.md                  # 发布流程说明（维护者用）
 └── tests/
     ├── test_nodes.py                 # 47 项真机验证
     ├── test_dynamic_outputs.mjs      # 前端扩展单元测试
