@@ -332,8 +332,13 @@ def step_commit(args):
         say("    无改动，跳过提交")
 
     if args.tag:
-        run(["git", "tag", "-a", args.tag, "-m", args.tag])
-        say(f"    已打 tag {args.tag}")
+        rc, _, _ = run(["git", "tag", "-a", args.tag, "-m", args.tag], check=False)
+        if rc == 0:
+            say(f"    已打 tag {args.tag}")
+        else:
+            # tag 已存在 = 重新发布同一版本 → 复用并强推到远端
+            say(f"    tag {args.tag} 已存在，复用（将强推覆盖远端）")
+            run(["git", "tag", "-f", args.tag, "-m", args.tag], check=False)
     return args.tag
 
 
@@ -352,10 +357,11 @@ def step_push(args, tag):
         env["http_proxy"] = proxy
         env["https_proxy"] = proxy
 
-    _, out, err = run(["git", "push", "origin", "HEAD"], check=False, env=env)
+    _, out, err = run(["git", "push", "origin", "HEAD:main"], check=False, env=env)
     say("    " + (out.strip() or err.strip()).splitlines()[-1])
     if tag:
-        _, out2, err2 = run(["git", "push", "origin", tag], check=False, env=env)
+        # 重新发布同一版本时 tag 可能已在远端，用 --force 覆盖
+        _, out2, err2 = run(["git", "push", "--force", "origin", tag], check=False, env=env)
         say("    " + (out2.strip() or err2.strip()).splitlines()[-1])
 
     if args.no_release or not tag:
