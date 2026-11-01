@@ -357,12 +357,27 @@ def step_push(args, tag):
         env["http_proxy"] = proxy
         env["https_proxy"] = proxy
 
-    _, out, err = run(["git", "push", "origin", "HEAD:main"], check=False, env=env)
-    say("    " + (out.strip() or err.strip()).splitlines()[-1])
+    def push_one(target, force=False):
+        """推送并重试。代理抖动时 git push 会失败，重试通常即通。"""
+        cmd = ["git", "push"] + (["--force"] if force else []) + ["origin", target]
+        for attempt in range(1, 4):
+            rc, out, err = run(cmd, check=False, env=env)
+            text = (out.strip() or err.strip()).splitlines()
+            last = text[-1] if text else ""
+            if rc == 0:
+                say(f"    {last}")
+                return True
+            if attempt < 3:
+                say(f"    … 推送失败（{last}），第 {attempt} 次重试")
+                time.sleep(3 * attempt)
+            else:
+                say(f"    [✗] 推送失败：{last}")
+        return False
+
+    push_one("HEAD:main")
     if tag:
         # 重新发布同一版本时 tag 可能已在远端，用 --force 覆盖
-        _, out2, err2 = run(["git", "push", "--force", "origin", tag], check=False, env=env)
-        say("    " + (out2.strip() or err2.strip()).splitlines()[-1])
+        push_one(tag, force=True)
 
     if args.no_release or not tag:
         say("    未创建 Release（--no-release 或无 tag）")
@@ -420,7 +435,19 @@ def step_push(args, tag):
 
 def step_verify(args):
     say("▸ 验证")
-    _, out, _ = run(["git", "ls-remote", "--tags", "origin"], check=False)
+    # push 刚完成时 GitHub 侧可能还没完全就绪 + 代理偶发抖动 → 必须重试
+    out = ""
+    for attempt in range(1, 4):
+        _, out, err = run(["git", "ls-remote", "--tags", "origin"], check=False)
+        if out.strip():
+            break
+        if attempt < 3:
+            say(f"    … 远端查询无响应，第 {attempt} 次重试")
+            time.sleep(2 * attempt)
+    if not out.strip():
+        say("    [跳过] 远端查询失败（网络问题），发布本身已完成")
+        return
+
     # refs/tags/v1.3.0^{} 是 annotated tag 的剥离标记，不是 tag 本身
     tags = []
     for line in out.splitlines():
@@ -433,7 +460,10 @@ def step_verify(args):
         if ref.startswith("refs/tags/"):
             tags.append(ref[len("refs/tags/"):])
     if args.tag:
-        say(f"    远端 tag {args.tag}：{'存在 ✓' if args.tag in tags else '缺失 ✗'}")
+        ok = args.tag in tags
+        say(f"    远端 tag {args.tag}：{'存在 ✓' if ok else '缺失 ✗'}")
+        if not ok:
+            say("    [注意] tag 未在远端出现，请手动核对 git ls-remote --tags origin")
     say(f"    远端 tags：{', '.join(t for t in tags if t.startswith('v')) or '（无）'}")
 
 
